@@ -162,7 +162,8 @@ so the firewall cannot see or block it. It's read-only and consciously left
 enabled in v1; details in [`DESIGN.md`](DESIGN.md).
 
 **Verifying the boundary:** run `boundary-check.sh` inside the container (as the
-agent) for an on-demand pass/fail check of the invariants — arbitrary egress
+agent, from the directory the session started in, which one of its checks reads)
+for an on-demand pass/fail check of the invariants — arbitrary egress
 blocked, IPv6 blocked, the control plane unreachable on any of its internal
 networks, agent holds no capabilities, `no_new_privs` set, no Docker socket, plus a
 set of attempts to abuse the egress proxy (non-443 CONNECT, SNI fronting, relaying

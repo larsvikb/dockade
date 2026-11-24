@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Boundary smoke test, shared by every sandbox tier.
 #
-# Run this INSIDE the container, as the sandbox agent, to assert the v1
+# Run this INSIDE the container, as the sandbox agent, from the session's start
+# directory (where the launch put it, under /workspace/), to assert the v1
 # containment boundary still holds:
 #     boundary-check.sh
 #
@@ -526,6 +527,19 @@ for ref in /refs/*/; do
     fi
 done
 [ "$refs" -gt 0 ] || info "/refs not mounted (SANDBOX_REFS unset)"
+# The session's start directory. Both launchers set -w to /workspace/<folder-name> in
+# every mode, for the reason in DESIGN.md, "The checkout mounts at
+# /workspace/<folder-name>". A lost -w falls back to the images' WORKDIR /workspace
+# and fails, as does a cd out of the checkout; a subdirectory of it passes. Read
+# physically, so an inherited PWD naming a symlink cannot pass, and as the `if`'s
+# condition, so a failed read is a FAIL.
+if ! workdir="$(pwd -P 2>/dev/null)"; then
+    bad "working directory unreadable — this check expects to run from the session's start directory, under /workspace/"
+elif [[ "$workdir" == /workspace/?* ]]; then
+    ok "working directory $workdir is under /workspace/"
+else
+    bad "working directory $workdir is not under /workspace/ — this check expects to run from the session's start directory"
+fi
 
 printf '%s== privilege ==%s\n' "$bold" "$reset"
 # THE load-bearing property: the agent holds no Linux capabilities, so it cannot

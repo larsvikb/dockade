@@ -275,11 +275,14 @@ panels' cancel and confirm, the pins sent, both kinds of countdown, and what a c
 once its resolve is answered. `tests/ui-harness/failing-state.test.js` drives the
 signals that something is wrong the same way: the approvals stream dropping, erring and
 going silent and the reconnect after each, the favicon lamp and conn text that follow
-it, the title and tab badges, and the saturation banner: its levels, its decay by the
+it, the title and tab badges, the saturation banner: its levels, its decay by the
 clock, and what Dismiss sends and shows when the acknowledgement is recorded, recorded
-short or refused. In `make test` `start()`'s DOM path has only the
-guards above and the free-name check below. Mutation testing is what showed the gap: every mutation in a
-pure helper was caught and every one inside `start()` survived.
+short or refused; and each list's stale vs failed views, for the decisions, policy,
+live leases, tool rules and pins: a failed first read, a failed refresh that keeps its
+rows, and the good read that clears the warning. For tool rules the good read is tested
+only after a failed refresh, as with nothing loaded there is no revoke to trigger one.
+In `make test` `start()`'s DOM path has only the guards above and the free-name check
+below. Mutation testing is what showed the gap: every mutation in a pure helper was caught and every one inside `start()` survived.
 
 What those tests guard against is bounded by what a frontend bug can and cannot do here. It **cannot** produce an
 out-of-policy rule: `resolve` validates the action against a fixed set and the pattern

@@ -85,6 +85,44 @@ const PINS = [
     sandbox_prefix: null },
 ];
 
+// The policy export, as `api_mcp._export_bytes` writes it: answered as raw bytes, not
+// JSON, since the page must save exactly these. The whole-second stamps carry Python's
+// `.0`, which `JSON.stringify` drops, so a page that parsed and re-serialized the body
+// would save other bytes.
+export const POLICY_EXPORT = `{
+  "format": "dockade-policy",
+  "format_version": 1,
+  "mcp_servers": [
+    {
+      "server": "mcp-github",
+      "enabled": true,
+      "auth": {
+        "type": "header",
+        "header": "Authorization",
+        "header_withheld": false,
+        "template": "Bearer {secret}",
+        "template_withheld": false
+      },
+      "endpoint": {
+        "port": 8082,
+        "path": "/mcp",
+        "path_withheld": false
+      },
+      "created_at": ${NOW - 86400}.0
+    }
+  ],
+  "tool_rules": [
+    {
+      "server": "mcp-github",
+      "tool": "get_me",
+      "action": "allow",
+      "source": "operator",
+      "created_at": ${NOW - 7200}.0
+    }
+  ]
+}
+`;
+
 // One hold of each kind the page draws a card for, both with something to confirm:
 // the egress hold two persist patterns, the tool ask two pinnable fields.
 export const HOLDS = [
@@ -220,6 +258,10 @@ export function setRules(rows) { GETS["/api/egress/rules"] = rows; }
 export function failRules() { rulesFailing = true; }
 export function abortConfig() { configAborted = true; }
 export function answerToolRulesLast() { toolRulesLast = true; }
+// How the policy export answers: "ok" with POLICY_EXPORT, "fail" with a 500, "drop" as
+// a request the network drops. The tests' only.
+let exportAnswer = "ok";
+export function answerExport(how) { exportAnswer = how; }
 
 // The tests', never the scenario's: each test in approval.test.js and
 // failing-state.test.js starts from `reset()`, and one changes what the backend says it
@@ -231,6 +273,7 @@ export function overrideResolve(change) { resolveOverride = change; }
 export function reset() {
   GETS["/api/egress/rules"] = RULES;
   rulesFailing = configAborted = toolRulesLast = false;
+  exportAnswer = "ok";
   answered.length = 0;
   resolveOverride = null;
 }
@@ -245,8 +288,9 @@ export function answeredLast(method, path) {
 const answered = [];
 export function answerOrder() { return answered.slice(); }
 
-// `{status, json}` for a request, `{abort: true}` for one the network drops, or null for
-// one this backend does not know — which the harness records, since a path the page
+// `{status, json}` for a request, `{status, body, contentType}` for one answered with
+// raw bytes, `{abort: true}` for one the network drops, or null for one this backend
+// does not know — which the harness records, since a path the page
 // asks for and no fixture answers is either a fixture to add or a change in what the
 // page asks.
 export function respond(method, path, body, query) {
@@ -269,6 +313,12 @@ export function respond(method, path, body, query) {
     return lease[1] === "2"
       ? { status: 404, json: { ok: false, detail: "unknown lease" } }
       : { status: 200, json: { ok: true } };
+  }
+  if (method === "GET" && path === "/api/mcp/export") {
+    if (exportAnswer === "drop") return { abort: true };
+    return exportAnswer === "fail"
+      ? { status: 500, json: { detail: "internal error" } }
+      : { status: 200, body: POLICY_EXPORT, contentType: "application/json" };
   }
   if (method === "GET" && path in GETS) return { status: 200, json: GETS[path] };
   const resolve = path.match(/^\/approvals\/([^/]+)\/resolve$/);

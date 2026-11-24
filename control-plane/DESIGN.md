@@ -819,6 +819,36 @@ per-surface action sets (dispatched on the card's kind, since the approval id al
 determines its table), each surface renders its own card, and the merged payload is a
 union of two per-surface builders rather than one query over a discriminator column.
 
+**The policy export is one builder, for the page and any later export.**
+`GET /api/mcp/export` serves `api_mcp._policy_export` through `_export_bytes`, and the
+MCP view's button saves those bytes unchanged. The file is the backend's rather than
+assembled in the page from `/api/mcp/rules` and `/api/mcp/servers`, whose views can be
+filtered or sorted for reading. Every caller gets one snapshot (`_policy_export`'s
+docstring says how). A wider export (egress rules, pins)
+adds its sections inside this builder rather than writing a second tool-rule format.
+
+The format is written to be read back by an import that does not exist yet. Import
+grants tools, so it is its own task with its own design. What the file commits to:
+
+- **A name and a version.** `format: "dockade-policy"` and `format_version`; a
+  change an older reader would misread raises the version.
+- **Every field a row is recreated from, and no id.** An id is local to one store; a
+  rule is keyed by (server, tool), its `UNIQUE` key, and a registration by its name.
+- **An absent section means "not exported", never "empty".** A later section is
+  added beside the two here, so an import must not read a missing key as "delete
+  all".
+- **Natural-key order, no timestamp.** Servers by name, rules by server then tool,
+  so one store gives byte-identical files and an action edit changes one line of a
+  diff. The date is in the file name.
+- **Withheld, not refused.** The file reports what the store holds, including rows
+  written before the write-time checks refused token-shaped values. A header name,
+  auth template or path that does not have the shape of configuration is exported as
+  null with a `..._withheld` flag. The export still succeeds, and the flag tells the
+  operator which registration the file cannot recreate. Each shape and why it is
+  that narrow is in the comments on the patterns in `control-plane/api_mcp.py`.
+  Server and tool names are exported as stored, as every view, audit row and backup
+  already shows them; a tool name is picked from what the server reported.
+
 ## The store, and the URLs
 
 *Schema note (read before adding a column).* The store is a long-lived named volume

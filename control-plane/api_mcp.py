@@ -10,6 +10,8 @@ config surface is the primary path rather than a retrofit.
 """
 from __future__ import annotations
 
+import json
+import re
 import time
 
 import inventory
@@ -17,7 +19,7 @@ import policy
 import provenance
 import store
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -591,3 +593,99 @@ def revoke_mcp_pin(pin_id: int, request: Request) -> JSONResponse:
                          f"{fields}"))
     return JSONResponse({"ok": True, "id": pin_id, "server": row["server"],
                          "tool": row["tool"], "was_live": was_live})
+
+
+# ── Policy export ────────────────────────────────────────────────────────────
+# The tool rules and server registrations as one file (control-plane/DESIGN.md, "The
+# policy export"). Each pattern below is the shape a stored value must have whole to
+# be exported; the reasons for withholding at all are there.
+
+_EXPORT_FORMAT = "dockade-policy"
+_EXPORT_VERSION = 1
+
+# A word of a header name or a path: ASCII letters only, at most 16. Long enough for
+# `Authorization` (13) and `Subscription` (12); a run of 17 letters, or any digit, is
+# a key rather than a word.
+_EXPORT_WORD = "[A-Za-z]{1,16}"
+# `{secret}`, or one scheme word, one space, `{secret}`. The scheme word is letters and
+# '-', up to 23, so `SharedAccessSignature` (21), `Zoho-oauthtoken` and
+# `Klaviyo-API-Key` are kept; 24 is `policy._TOKEN_RUN_MIN`'s pasted token. Nothing
+# may follow `{secret}`, which is where a pasted token sits beside the reference.
+_EXPORT_TEMPLATE_RE = re.compile(r"(?:[A-Za-z-]{1,23} )?\{secret\}")
+# Words joined by single '-'. Narrower than the write-time format
+# (`policy._HEADER_CHARS`, up to `policy._HEADER_MAX_LEN`), which admits a hex key, a
+# UUID or any alphanumeric token as a header name.
+_EXPORT_HEADER_RE = re.compile(rf"{_EXPORT_WORD}(?:-{_EXPORT_WORD})*")
+# '/'-separated segments, each words joined by single '-', '_' or '.', or a version
+# (`v` and 1 to 3 digits); a trailing '/' allowed. A hosted server's key can sit in a
+# path segment, and `policy._PATH_RE` admits it. Every split here is fixed by a
+# separator, so a failed match stays linear in the path's length.
+_EXPORT_SEGMENT = rf"(?:v[0-9]{{1,3}}|{_EXPORT_WORD}(?:[-_.]{_EXPORT_WORD})*)"
+_EXPORT_PATH_RE = re.compile(rf"/(?:{_EXPORT_SEGMENT}(?:/{_EXPORT_SEGMENT})*/?)?")
+
+
+def _withheld(value, pattern) -> tuple:
+    """``value`` and False if it is null or a string ``pattern`` matches whole; else
+    None and True. SQLite will hold a BLOB in a TEXT column, and the export withholds
+    it rather than failing on it."""
+    if value is None:
+        return None, False
+    if isinstance(value, str) and pattern.fullmatch(value):
+        return value, False
+    return None, True
+
+
+def _export_server(row) -> dict:
+    """``_server_view``'s fields, every one a registration is recreated from, with a
+    flag beside each field withheld by shape."""
+    header, header_withheld = _withheld(row["auth_header"], _EXPORT_HEADER_RE)
+    template, template_withheld = _withheld(row["auth_template"], _EXPORT_TEMPLATE_RE)
+    path, path_withheld = _withheld(row["path"], _EXPORT_PATH_RE)
+    return {"server": row["server"], "enabled": bool(row["enabled"]),
+            "auth": {"type": row["auth_type"],
+                     "header": header, "header_withheld": header_withheld,
+                     "template": template, "template_withheld": template_withheld},
+            "endpoint": {"port": row["port"], "path": path,
+                         "path_withheld": path_withheld},
+            "created_at": row["created_at"]}
+
+
+def _policy_export(conn) -> dict:
+    """The export document, read from ``conn``, which must have no transaction open.
+
+    Both reads in one deferred transaction, so a rule written between them cannot
+    land in a file whose servers were read before its server was registered. Here
+    rather than in the route, so every caller gets the one snapshot. A rule carries no
+    `id`: ids are local to a store, and (server, tool) is its key."""
+    conn.execute("BEGIN")
+    try:
+        servers = conn.execute(
+            "SELECT server, enabled, auth_type, auth_header, auth_template, "
+            "created_at, port, path FROM mcp_servers ORDER BY server").fetchall()
+        rules = conn.execute(
+            "SELECT server, tool, action, source, created_at FROM tool_rules "
+            "ORDER BY server, tool").fetchall()
+    finally:
+        conn.rollback()
+    return {"format": _EXPORT_FORMAT, "format_version": _EXPORT_VERSION,
+            "mcp_servers": [_export_server(r) for r in servers],
+            "tool_rules": [{"server": r["server"], "tool": r["tool"],
+                            "action": r["action"], "source": r["source"],
+                            "created_at": r["created_at"]} for r in rules]}
+
+
+def _export_bytes(doc: dict) -> bytes:
+    """The file: keys in the order built, a two-space indent, ASCII only, a final
+    newline. One store gives the same bytes every time."""
+    return (json.dumps(doc, indent=2, ensure_ascii=True) + "\n").encode("ascii")
+
+
+@router.get("/api/mcp/export")
+def api_mcp_export() -> Response:
+    """Every tool rule and server registration, as the file the page downloads.
+
+    Served as bytes rather than a dict, so the file is exactly what ``_export_bytes``
+    wrote and the page saves it unchanged."""
+    with store._connect() as conn:
+        doc = _policy_export(conn)
+    return Response(_export_bytes(doc), media_type="application/json")

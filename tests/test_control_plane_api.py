@@ -5114,6 +5114,354 @@ class McpToolRuleRevokeTests(_CPTestCase):
                     cp.policy._decide_tool("mcp-github", "get_me")[0], "allow")
 
 
+#: Invented keys in the shapes a credential takes: 40 hex, a UUID, 24 letters and
+#: digits. The export must never carry one, whichever field it was pasted into.
+_HEX_KEY = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b"
+_UUID_KEY = "5a1f3c2e-9b7d-4e0f-8a6c-1d2b3e4f5a6b"
+_ALNUM_KEY = "Q7xK2mP9vR4tL8nW3hJ6cB1z"
+
+
+class McpPolicyExportShapeTests(unittest.TestCase):
+    """What the export withholds, field by field: each pattern alone, at its bounds,
+    and against the keys a token-shaped value takes."""
+
+    def _check(self, pattern, kept, withheld):
+        for value in kept:
+            with self.subTest(kept=value):
+                self.assertEqual(cp.api_mcp._withheld(value, pattern), (value, False))
+        for value in withheld:
+            with self.subTest(withheld=value):
+                self.assertEqual(cp.api_mcp._withheld(value, pattern), (None, True))
+
+    def test_a_null_is_exported_as_null_and_not_flagged(self):
+        for pattern in (cp.api_mcp._EXPORT_TEMPLATE_RE, cp.api_mcp._EXPORT_HEADER_RE,
+                        cp.api_mcp._EXPORT_PATH_RE):
+            self.assertEqual(cp.api_mcp._withheld(None, pattern), (None, False))
+
+    def test_template(self):
+        self._check(
+            cp.api_mcp._EXPORT_TEMPLATE_RE,
+            kept=["{secret}", "Bearer {secret}", "Basic {secret}",
+                  "SharedAccessSignature {secret}", "Zoho-oauthtoken {secret}",
+                  "Klaviyo-API-Key {secret}",
+                  # The bound, 23, with a '-' in it, so a scheme word of letters
+                  # alone fails here as well as at the named schemes.
+                  "Shared-AccessSignatures {secret}"],
+            withheld=["{secret}" + _ALNUM_KEY, "Bearer {secret}" + _ALNUM_KEY,
+                      "{secret} " + _ALNUM_KEY, "Bearer {secret}x",
+                      _ALNUM_KEY + " {secret}", _HEX_KEY + " {secret}",
+                      "Bearer Token {secret}", "Bearer2 {secret}", "Bear_er {secret}",
+                      # 24, one past the bound.
+                      "Shared-AccessSignaturesX {secret}",
+                      "Bearer  {secret}", " {secret}", "Bearer", "", "{SECRET}"])
+
+    def test_header_name(self):
+        self._check(
+            cp.api_mcp._EXPORT_HEADER_RE,
+            kept=["Authorization", "X-API-Key", "PRIVATE-TOKEN", "X-Goog-Api-Key",
+                  "Ocp-Apim-Subscription-Key",
+                  # A word of 16, alone and joined.
+                  "Abcdefghijklmnop", "X-Abcdefghijklmnop"],
+            withheld=[_HEX_KEY, _UUID_KEY, _ALNUM_KEY,
+                      # 17 letters in a row, alone and as a later word.
+                      "Abcdefghijklmnopq", "X-Abcdefghijklmnopq",
+                      "X-Api-Key-2", "-X-Key", "X-Key-", "X--Key", "X Key", "X_Key",
+                      ""])
+
+    def test_path(self):
+        self._check(
+            cp.api_mcp._EXPORT_PATH_RE,
+            kept=["/", "/mcp", "/v1/mcp", "/api/mcp/", "/v999/mcp", "/mcp/v1",
+                  "/a_b.c-d/mcp", "/Abcdefghijklmnop", "/x-Abcdefghijklmnop/mcp"],
+            withheld=["/" + _HEX_KEY + "/mcp", "/mcp/" + _UUID_KEY,
+                      "/" + _ALNUM_KEY, "/v1000/mcp", "/Abcdefghijklmnopq",
+                      # A number is a version only after `v`.
+                      "/1/mcp", "/x1/mcp",
+                      "/x-Abcdefghijklmnopq", "/2025-06-18/mcp", "/mcp2",
+                      "mcp", "", "//mcp", "/mcp//", "/a--b", "/a-_b", "/-a", "/a-",
+                      "/a~b"])
+
+
+class McpPolicyExportTests(_CPTestCase):
+    """``GET /api/mcp/export``: the file, byte for byte, from rows written by SQL as
+    a store could hold them from before the write-time checks refused them."""
+
+    #: (server, enabled, auth_type, auth_header, auth_template, port, path,
+    #: created_at), inserted and created out of name order, so neither the insert nor
+    #: the creation time sorts them. Three each carry one token-shaped field.
+    SERVERS: ClassVar[list] = [
+        ("mcp-tailtoken", 1, "header", "Authorization", "{secret}" + _ALNUM_KEY,
+         8082, "/api/mcp/", 1767225600.0),
+        ("mcp-github", 0, "none", None, None, 8082, "/mcp", 1767225601.5),
+        ("mcp-hexpath", 0, "header", "X-API-Key", "{secret}", 3000,
+         "/" + _HEX_KEY + "/mcp", 1767225603.0),
+        ("mcp-azure", 1, "header", "Authorization", "SharedAccessSignature {secret}",
+         8082, "/mcp", 1767225604.0),
+        ("mcp-hexheader", 1, "header", _HEX_KEY, "{secret}", 8082, "/v1/mcp",
+         1767225602.0),
+    ]
+    #: (server, tool, action, source, created_at), inserted out of order. By tool,
+    #: not allow-ask-deny as `/api/mcp/rules` sorts them.
+    RULES: ClassVar[list] = [
+        ("mcp-github", "list_commits", "deny", "operator", 1767225700.0),
+        ("mcp-azure", "query", "ask", "operator", 1767225701.0),
+        ("mcp-github", "get_me", "allow", "operator", 1767225702.25),
+        ("mcp-github", "create_pull_request", "ask", "operator", 1767225703.0),
+    ]
+
+    EXPECTED = """\
+{
+  "format": "dockade-policy",
+  "format_version": 1,
+  "mcp_servers": [
+    {
+      "server": "mcp-azure",
+      "enabled": true,
+      "auth": {
+        "type": "header",
+        "header": "Authorization",
+        "header_withheld": false,
+        "template": "SharedAccessSignature {secret}",
+        "template_withheld": false
+      },
+      "endpoint": {
+        "port": 8082,
+        "path": "/mcp",
+        "path_withheld": false
+      },
+      "created_at": 1767225604.0
+    },
+    {
+      "server": "mcp-github",
+      "enabled": false,
+      "auth": {
+        "type": "none",
+        "header": null,
+        "header_withheld": false,
+        "template": null,
+        "template_withheld": false
+      },
+      "endpoint": {
+        "port": 8082,
+        "path": "/mcp",
+        "path_withheld": false
+      },
+      "created_at": 1767225601.5
+    },
+    {
+      "server": "mcp-hexheader",
+      "enabled": true,
+      "auth": {
+        "type": "header",
+        "header": null,
+        "header_withheld": true,
+        "template": "{secret}",
+        "template_withheld": false
+      },
+      "endpoint": {
+        "port": 8082,
+        "path": "/v1/mcp",
+        "path_withheld": false
+      },
+      "created_at": 1767225602.0
+    },
+    {
+      "server": "mcp-hexpath",
+      "enabled": false,
+      "auth": {
+        "type": "header",
+        "header": "X-API-Key",
+        "header_withheld": false,
+        "template": "{secret}",
+        "template_withheld": false
+      },
+      "endpoint": {
+        "port": 3000,
+        "path": null,
+        "path_withheld": true
+      },
+      "created_at": 1767225603.0
+    },
+    {
+      "server": "mcp-tailtoken",
+      "enabled": true,
+      "auth": {
+        "type": "header",
+        "header": "Authorization",
+        "header_withheld": false,
+        "template": null,
+        "template_withheld": true
+      },
+      "endpoint": {
+        "port": 8082,
+        "path": "/api/mcp/",
+        "path_withheld": false
+      },
+      "created_at": 1767225600.0
+    }
+  ],
+  "tool_rules": [
+    {
+      "server": "mcp-azure",
+      "tool": "query",
+      "action": "ask",
+      "source": "operator",
+      "created_at": 1767225701.0
+    },
+    {
+      "server": "mcp-github",
+      "tool": "create_pull_request",
+      "action": "ask",
+      "source": "operator",
+      "created_at": 1767225703.0
+    },
+    {
+      "server": "mcp-github",
+      "tool": "get_me",
+      "action": "allow",
+      "source": "operator",
+      "created_at": 1767225702.25
+    },
+    {
+      "server": "mcp-github",
+      "tool": "list_commits",
+      "action": "deny",
+      "source": "operator",
+      "created_at": 1767225700.0
+    }
+  ]
+}
+"""
+
+    #: Every key the file may hold, level by level. A field added to a registration or
+    #: a rule fails here until it is declared, so a secret, or a reference to where one
+    #: is kept, cannot reach the file unreviewed.
+    KEYS: ClassVar[dict] = {
+        "top": {"format", "format_version", "mcp_servers", "tool_rules"},
+        "server": {"server", "enabled", "auth", "endpoint", "created_at"},
+        "auth": {"type", "header", "header_withheld", "template", "template_withheld"},
+        "endpoint": {"port", "path", "path_withheld"},
+        "rule": {"server", "tool", "action", "source", "created_at"},
+    }
+
+    def _store(self):
+        with cp.store._connect() as conn:
+            conn.executemany(
+                "INSERT INTO mcp_servers(server, enabled, auth_type, auth_header, "
+                "auth_template, port, path, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                self.SERVERS)
+            conn.executemany(
+                "INSERT INTO tool_rules(server, tool, action, source, created_at) "
+                "VALUES (?,?,?,?,?)", self.RULES)
+            conn.commit()
+
+    def _export(self) -> bytes:
+        resp = cp.api_mcp.api_mcp_export()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.kwargs["media_type"], "application/json")
+        return resp.body
+
+    def test_the_file_is_the_store_in_natural_key_order_with_tokens_withheld(self):
+        self._store()
+        self.assertEqual(self._export().decode("ascii"), self.EXPECTED)
+
+    def test_each_token_shaped_server_has_exactly_its_own_field_withheld(self):
+        self._store()
+        doc = json.loads(self._export())
+        flags = {s["server"]: {name for name, on in
+                               (("header", s["auth"]["header_withheld"]),
+                                ("template", s["auth"]["template_withheld"]),
+                                ("path", s["endpoint"]["path_withheld"])) if on}
+                 for s in doc["mcp_servers"]}
+        self.assertEqual(flags, {"mcp-azure": set(), "mcp-github": set(),
+                                 "mcp-hexheader": {"header"},
+                                 "mcp-hexpath": {"path"},
+                                 "mcp-tailtoken": {"template"}})
+
+    def test_no_secret_or_credential_field_reaches_the_file(self):
+        self._store()
+        body = self._export()
+        for key in (_HEX_KEY, _ALNUM_KEY):
+            self.assertNotIn(key.encode(), body)
+        doc = json.loads(body)
+        self.assertEqual(set(doc), self.KEYS["top"])
+        for server in doc["mcp_servers"]:
+            self.assertEqual(set(server), self.KEYS["server"], server["server"])
+            self.assertEqual(set(server["auth"]), self.KEYS["auth"], server["server"])
+            self.assertEqual(set(server["endpoint"]), self.KEYS["endpoint"],
+                             server["server"])
+        for rule in doc["tool_rules"]:
+            self.assertEqual(set(rule), self.KEYS["rule"], rule["tool"])
+
+    def test_a_blob_in_a_withheld_field_is_withheld_not_a_failure(self):
+        # SQLite keeps a BLOB in a TEXT column as given; the export still succeeds.
+        with cp.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO mcp_servers(server, enabled, auth_type, auth_header, "
+                "auth_template, port, path, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                ("mcp-blob", 0, "header", b"Authorization", b"{secret}", 8082, b"/mcp",
+                 1767225600.0))
+            conn.commit()
+        server = json.loads(self._export())["mcp_servers"][0]
+        self.assertEqual(server["auth"], {"type": "header", "header": None,
+                                          "header_withheld": True, "template": None,
+                                          "template_withheld": True})
+        self.assertEqual(server["endpoint"], {"port": 8082, "path": None,
+                                              "path_withheld": True})
+
+    def test_the_file_is_ascii_whatever_the_store_holds(self):
+        # A tool name is the server's text: escaped, the file stays ASCII and reads
+        # the same under any encoding a reader assumes.
+        self.assertEqual(cp.api_mcp._export_bytes({"tool": "café"}),
+                         b'{\n  "tool": "caf\\u00e9"\n}\n')
+
+    def test_an_empty_store_exports_both_sections_empty(self):
+        self.assertEqual(self._export(),
+                         b'{\n  "format": "dockade-policy",\n  "format_version": 1,\n'
+                         b'  "mcp_servers": [],\n  "tool_rules": []\n}\n')
+
+    def test_the_same_store_gives_the_same_bytes(self):
+        self._store()
+        self.assertEqual(self._export(), self._export())
+
+    def test_an_action_edit_changes_one_line(self):
+        self._store()
+        before = self._export().decode("ascii").splitlines()
+        with cp.store._connect() as conn:
+            conn.execute("UPDATE tool_rules SET action='deny' WHERE tool='get_me'")
+            conn.commit()
+        after = self._export().decode("ascii").splitlines()
+        self.assertEqual(len(before), len(after))
+        self.assertEqual([(b, a) for b, a in zip(before, after) if b != a],
+                         [('      "action": "allow",', '      "action": "deny",')])
+
+    def test_a_rule_written_between_the_two_reads_is_not_in_the_file(self):
+        # One snapshot: the servers were read before the rule landed, so the file
+        # must not carry it, and the write must have landed rather than been locked
+        # out, or this shows nothing.
+        self._store()
+        late = ("INSERT INTO tool_rules(server, tool, action, source, created_at) "
+                "VALUES ('mcp-azure', 'late', 'allow', 'operator', 1767225800.0)")
+        with (_write_after_the_read("SELECT server, enabled", late) as landed,
+              cp.store._connect() as conn):
+            doc = cp.api_mcp._policy_export(conn)
+            # Ended by the builder, not left for the caller's context manager.
+            self.assertFalse(conn.in_transaction)
+        self.assertEqual(landed, [True], "the write was locked out, or the hook never "
+                                         "saw the servers read")
+        self.assertNotIn("late", [r["tool"] for r in doc["tool_rules"]])
+        self.assertIn("late", [r["tool"] for r in json.loads(self._export())
+                               ["tool_rules"]])
+
+    def test_the_builder_refuses_a_connection_already_in_a_transaction(self):
+        # Its snapshot would be the caller's, begun who knows when.
+        with cp.store._connect() as conn:
+            conn.execute("BEGIN")
+            with self.assertRaises(sqlite3.OperationalError):
+                cp.api_mcp._policy_export(conn)
+            conn.rollback()
+
+
 #: The digest of a tool's arguments a call is made under unless a test says otherwise,
 #: and the digest of the same tool's arguments after an upgrade moved them.
 _SCHEMA = "5c" * 32
@@ -10355,7 +10703,8 @@ class ApiSurfaceSplitTests(unittest.TestCase):
         # be able to read them either.
         for path in ("/approvals", "/approvals/stream", "/api/audit",
                      "/api/audit/events", "/api/egress/rules", "/api/mcp/servers",
-                     "/api/mcp/rules", "/api/mcp/pins", "/api/config", "/status"):
+                     "/api/mcp/rules", "/api/mcp/pins", "/api/mcp/export",
+                     "/api/config", "/status"):
             self.assertIn(("GET", path), _routes(cp.app), path)
             self.assertNotIn(("GET", path), _routes(cp.authorize_app), path)
             # Nor on the gateway's bridge. It reads policy — that is what the roster

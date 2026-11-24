@@ -15,6 +15,7 @@ import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import * as backend from "./backend.js";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { BROWSER, launch, openPage } from "./page.js";
 
 const uiDir = process.argv[2];
@@ -367,3 +368,60 @@ test("a pin reports the fields the backend pinned, not the boxes ticked", TIMEOU
                    ["✓ allowed · pinned for good on owner, repo (pin 5) · runs when the "
                     + "agent returns for it", "cardmsg ok", ["done-allow"]]);
 });
+
+// ── the MCP tab's policy export ─────────────────────────────────────────────
+
+// The page on its MCP tab, every download it starts kept in `downloads`.
+async function toolsTab(t) {
+  backend.reset();
+  const run = await openPage(browser, uiDir, backend);
+  t.after(() => run.close());
+  const { page, helpers } = run;
+  const downloads = [];
+  page.on("download", d => downloads.push(d));
+  await helpers.load();
+  await helpers.settle();
+  await page.click("#tab-tools");
+  await helpers.settle();
+  return { page, helpers, downloads };
+}
+
+test("the export saves the backend's bytes, unchanged, under the day's name", TIMEOUT,
+     async t => {
+  const { page, helpers } = await toolsTab(t);
+  const saved = page.waitForEvent("download");
+  await page.click("#mcp-export");
+  await helpers.settle();
+  const download = await saved;
+  // backend.js's NOW is 15 September 2026, the same day in the harness's zone.
+  assert.equal(download.suggestedFilename(), "dockade-mcp-policy-2026-09-15.json");
+  assert.equal(await readFile(await download.path(), "utf8"), backend.POLICY_EXPORT);
+  assert.equal(await page.locator("#mcp-export").isDisabled(), false);
+  assert.equal(await text(page.locator("#mcp-export-status")), "");
+});
+
+for (const [how, status] of [
+  ["fail", "Could not export: the control plane answered HTTP 500."],
+  ["drop", "Could not export: the control plane is unreachable."],
+]) {
+  test(`an export the backend does not answer (${how}) says so and saves nothing`,
+       TIMEOUT, async t => {
+    const { page, helpers, downloads } = await toolsTab(t);
+    backend.answerExport(how);
+    await page.click("#mcp-export");
+    await helpers.settle();
+    // A download is started by the click's own turn, so by now it would have arrived.
+    await new Promise(r => setTimeout(r, 500));
+    assert.equal(downloads.length, 0);
+    assert.equal(await text(page.locator("#mcp-export-status")), status);
+    assert.equal(await page.locator("#mcp-export").isDisabled(), false);
+    // Tried again once the backend answers: the old failure goes with it.
+    backend.answerExport("ok");
+    const saved = page.waitForEvent("download");
+    await page.click("#mcp-export");
+    await helpers.settle();
+    await saved;
+    assert.equal(downloads.length, 1);
+    assert.equal(await text(page.locator("#mcp-export-status")), "");
+  });
+}

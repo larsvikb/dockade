@@ -7,6 +7,9 @@ and boundary-check.sh read the agent's capability sets after the privilege drop,
 clears them whatever Docker granted, so an extra ``--cap-add`` or ``--privileged`` is
 invisible from inside. This reads the launchers' text instead, over the same glob as
 the Makefile's ``LAUNCHERS``, so a new launcher is held without being registered.
+It also refuses ``--entrypoint``, whatever its value: the firewall and the
+privilege drop live in the image's entrypoint (sandbox-common/entrypoint.sh), which
+it would replace.
 
 The guard parses shell text, so flags carried in an array (``RUN_MODE_ARGS``, the
 ``SC_*_ARGS``) are invisible to it: a required flag moved into one reads as missing,
@@ -137,6 +140,8 @@ def run_problems(words: list[str]) -> list[str]:
             problems.append(f"--pids-limit={limit} is not a positive number")
     if any(f == "--privileged" for f, _ in options):
         problems.append("--privileged")
+    for entrypoint in values("--entrypoint"):
+        problems.append(f"--entrypoint={entrypoint} replaces the image's entrypoint")
     return problems
 
 
@@ -237,6 +242,29 @@ class RunFlagCheckerTests(unittest.TestCase):
 
     def test_privileged_is_reported(self):
         self.assertReports(_with("--privileged"), "docker run #1: --privileged")
+
+    def test_an_entrypoint_is_reported_in_either_spelling_whatever_its_value(self):
+        for line, value in (("--entrypoint /bin/bash", "/bin/bash"),
+                            ("--entrypoint=bash", "bash"),
+                            ("--entrypoint=", ""),
+                            ('--entrypoint ""', "")):
+            with self.subTest(line=line):
+                self.assertReports(
+                    _with(line),
+                    f"docker run #1: --entrypoint={value} replaces the image's entrypoint")
+
+    def test_each_entrypoint_is_reported(self):
+        problems = launcher_problems(_with("--entrypoint=/bin/sh --entrypoint /bin/bash"))
+        self.assertEqual(
+            [p for p in problems if "--entrypoint" in p],
+            ["docker run #1: --entrypoint=/bin/sh replaces the image's entrypoint",
+             "docker run #1: --entrypoint=/bin/bash replaces the image's entrypoint"])
+
+    def test_an_entrypoint_after_the_image_does_not_count(self):
+        # The container's command, as in test_a_flag_after_the_image_does_not_count.
+        image = '    "$IMAGE_NAME" '
+        moved = _mutant(image, f"{image}--entrypoint /bin/bash ")
+        self.assertEqual(launcher_problems(moved), [])
 
     def test_a_second_docker_run_is_held_to_the_same_flags(self):
         text = _CLAUDE + '\ndocker run --rm --cap-drop=ALL \\\n    "$IMAGE_NAME" true\n'

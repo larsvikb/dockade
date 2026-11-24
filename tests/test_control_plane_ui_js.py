@@ -267,7 +267,8 @@ const owner = {
              "serverEditPreview", "serverEditBody", "serverSaveBody",
              "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
              "pinText", "pinState", "pinReach", "pinExpiry", "pinLapsesDue",
-             "toolArgsChanged", "toolPick", "toolPreviewShown", "exportFileName"],
+             "toolArgsChanged", "toolPick", "toolPreviewShown", "toolRulesShown",
+             "exportFileName"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
                 "groupLeases"],
   "status.js": ["auditStatus", "rulesStatus", "toolRulesStatus", "toolPinsStatus",
@@ -427,11 +428,38 @@ console.log(JSON.stringify({
       edit_bogus_action: m.toolEditPreview(rules[0], "sudo"),
       revoke_allow: m.toolRevokePreview(rules[0]),
       revoke_deny: m.toolRevokePreview(rules[1]),
-      status_empty: m.toolRulesStatus(0, false, true),
-      status_stale: m.toolRulesStatus(3, true, true),
-      status_cold: m.toolRulesStatus(0, true, false),
-      status_quiet: m.toolRulesStatus(2, false, true),
+      status_empty: m.toolRulesStatus(0, false, true, "", 0),
+      status_stale: m.toolRulesStatus(3, true, true, "mcp-github", 3),
+      status_cold: m.toolRulesStatus(0, true, false, "", 0),
+      status_quiet: m.toolRulesStatus(2, false, true, "mcp-github", 2),
       rank: m.TOOL_ACTION_RANK,
+    };
+  })(),
+  // The tool rules table follows the form's server: two servers' rules in API order
+  // (server, then allow/ask/deny, then tool), and the status line under each filter.
+  toolrulesshown: (() => {
+    const rules = [
+      { id: 7, server: "mcp-acme", tool: "get_me", action: "allow" },
+      { id: 3, server: "mcp-acme", tool: "push", action: "deny" },
+      { id: 5, server: "mcp-widgets", tool: "search", action: "ask" },
+    ];
+    const ids = s => ({ ids: s.rows.map(r => r.id), total: s.total, label: s.label });
+    return {
+      acme: ids(m.toolRulesShown(rules, "mcp-acme")),
+      widgets: ids(m.toolRulesShown(rules, "mcp-widgets")),
+      unknown: ids(m.toolRulesShown(rules, "mcp-gone")),
+      no_server: ids(m.toolRulesShown(rules, "")),
+      only_server: ids(m.toolRulesShown(rules.slice(0, 2), "mcp-acme")),
+      one_only: ids(m.toolRulesShown(rules.slice(2), "mcp-widgets")),
+      none_loaded: ids(m.toolRulesShown([], "mcp-acme")),
+      status_elsewhere: m.toolRulesStatus(0, false, true, "mcp-gone", 3),
+      status_nowhere: m.toolRulesStatus(0, false, true, "mcp-acme", 0),
+      status_waiting: m.toolRulesStatus(0, false, true, "", 3),
+      status_waiting_one: m.toolRulesStatus(0, false, true, "", 1),
+      status_stale_hidden: m.toolRulesStatus(0, true, true, "mcp-gone", 3),
+      status_cold_hidden: m.toolRulesStatus(0, true, false, "", 3),
+      status_unloaded: m.toolRulesStatus(0, false, false, "mcp-acme", 3),
+      status_shown: m.toolRulesStatus(1, false, true, "mcp-widgets", 3),
     };
   })(),
   // The tool picker's value folded through renders the way `renderToolPicker` draws
@@ -2011,6 +2039,49 @@ class PageScriptTests(unittest.TestCase):
         self.assertEqual(tp["status_cold"]["level"], "warn")
         # Rows and no failure is the ordinary state, and says nothing at all.
         self.assertFalse(tp["status_quiet"]["show"])
+
+    def test_the_tool_rules_table_shows_the_picked_servers_rules(self):
+        """The table follows the form's server select: that server's rows in the API's
+        order, none for a server with none or for no server, and a count that adds
+        "of M" whenever the rows are not every rule loaded."""
+        shown = self.probe["toolrulesshown"]
+        expected = {
+            "acme": {"ids": [7, 3], "total": 3, "label": "· 2 rules of 3"},
+            "widgets": {"ids": [5], "total": 3, "label": "· 1 rule of 3"},
+            "unknown": {"ids": [], "total": 3, "label": "· 0 rules of 3"},
+            "no_server": {"ids": [], "total": 3, "label": "· 0 rules of 3"},
+            "only_server": {"ids": [7, 3], "total": 2, "label": "· 2 rules"},
+            "one_only": {"ids": [5], "total": 1, "label": "· 1 rule"},
+            "none_loaded": {"ids": [], "total": 0, "label": "· none"},
+        }
+        for key, want in expected.items():
+            with self.subTest(case=key):
+                self.assertEqual(shown[key], want)
+
+    def test_an_empty_filtered_table_says_which_empty_it_is(self):
+        """One server's table empty is not an empty tool policy, and no server to pick
+        is neither: each has its own sentence, and a failure outranks all of them."""
+        shown = self.probe["toolrulesshown"]
+        tp = self.probe["toolpolicy"]
+        self.assertEqual(shown["status_elsewhere"], {
+            "show": True, "level": "none",
+            "text": "No tool rules for mcp-gone, so every call to its tools is denied. "
+                    "Other servers have rules: pick one above to see them."})
+        self.assertEqual(shown["status_nowhere"], tp["status_empty"])
+        self.assertEqual(shown["status_waiting"], {
+            "show": True, "level": "none",
+            "text": "3 tool rules loaded, shown here once a server can be picked "
+                    "above."})
+        self.assertEqual(shown["status_waiting_one"]["text"],
+                         "1 tool rule loaded, shown here once a server can be picked "
+                         "above.")
+        # Failed reads as failed whether or not the filter hides every row.
+        self.assertEqual(shown["status_stale_hidden"], tp["status_stale"])
+        self.assertEqual(shown["status_cold_hidden"], tp["status_cold"])
+        # Before the first load nothing is claimed; with rows, nothing is said.
+        quiet = {"show": False, "level": "none", "text": ""}
+        self.assertEqual(shown["status_unloaded"], quiet)
+        self.assertEqual(shown["status_shown"], quiet)
 
     def test_the_lamp_treats_being_blind_as_worse_than_being_busy(self):
         lamp = self.probe["lamp"]
@@ -3876,7 +3947,7 @@ class ToolArgsChangedTests(unittest.TestCase):
 
     def test_the_rules_table_and_the_picker_both_show_it(self):
         src = MCP_JS.read_text()
-        rows = _fn_body(src, "renderToolRules(rows)", "")
+        rows = _fn_body(src, "renderToolRules()", "")
         picker = _fn_body(src, "renderToolPicker()", "")
         self.assertIn("const reshaped = toolArgsChanged(entry, row.tool);", rows)
         self.assertIn(": reshaped ? `yes — ${reshaped}` : \"yes\"", rows)
@@ -5186,7 +5257,7 @@ class ToolPolicySourceTests(unittest.TestCase):
 
     def setUp(self):
         self.src = MCP_JS.read_text()
-        self.rows = _fn_body(self.src, "renderToolRules(rows)", "")
+        self.rows = _fn_body(self.src, "renderToolRules()", "")
         self.poll = _fn_body(self.src, "refreshToolRules()", "")
         self.picker = _fn_body(self.src, "renderToolPicker()", "")
         self.preview = _fn_body(self.src, "renderToolRulePreview()", "")
@@ -5343,6 +5414,31 @@ class ToolPolicySourceTests(unittest.TestCase):
             r'toolRulePreviewEl\.className = "empty" \+ \(\1\.wild \? " wild" : ""\);'
             r"[\s\S]*toolRulePreviewEl\.textContent = \1\.text;")
         self.assertNotIn("toolNotice.text", self.preview)
+
+    def test_the_server_options_are_rebuilt_before_the_table_reads_them(self):
+        """The table shows the rules of the server the select holds, and rebuilding
+        the options can change that value; drawn before the rebuild, it shows the
+        previous server's rows (or none) under the new one. The ui-test's
+        rules-before-servers case shows it in a browser."""
+        body = _fn_body(self.src, "renderToolPolicy()", "")
+        self.assertRegex(body, r"^\s*renderToolServerOptions\(\);\s*renderToolRules\(\);"
+                               r"\s*renderToolPicker\(\);\s*$")
+        self.assertIn("toolRulesShown(toolRules, server)", self.rows)
+        self.assertIn("const server = toolRuleServer.value;", self.rows)
+        # A row button acts only on a rule that is on screen: the map holds the drawn
+        # rows, never the full list. No click in a browser can tell the two apart while
+        # every button belongs to a drawn row, so this is held at the source.
+        self.assertIn("toolRulesById = new Map(rows.map(", self.rows)
+
+    def test_the_rules_refresh_and_the_inventory_poll_redraw_the_whole_block(self):
+        """Each ends by drawing the table as well as the picker: the table's rows and
+        count come from the rules, its `exposed` column from the inventory. Neither
+        browser suite reaches a path where redrawing only the picker would show."""
+        inventory = _fn_body(self.src, "refreshInventory()", "")
+        for name, body in (("refreshToolRules", self.poll), ("refreshInventory", inventory)):
+            with self.subTest(refresh=name):
+                self.assertRegex(body, r"\n  renderToolPolicy\(\);\s*$")
+                self.assertNotIn("renderToolPicker()", body)
 
     def test_only_the_tool_selects_own_change_makes_the_pick_the_operators(self):
         handler = re.search(r'toolRuleTool\.addEventListener\("change"[\s\S]*?\n  \}\);',

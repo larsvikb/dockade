@@ -675,9 +675,11 @@
     <h2>Tool policy <span class="note" id="toolrulecount"></span></h2>
     <div class="empty">
       What each registered server&rsquo;s tools may do. A tool with no rule is
-      <strong>denied</strong> &mdash; not held, not asked about &mdash; so this table is
-      the whole of what the gateway will let through. An explicit <code>deny</code> is
-      still worth writing: it decides the same thing and records that a human looked.
+      <strong>denied</strong> &mdash; not held, not asked about &mdash; so every
+      server&rsquo;s rules together are the whole of what the gateway will let through.
+      The table below shows the rules of the server picked in the form. An explicit
+      <code>deny</code> is still worth writing: it decides the same thing and records
+      that a human looked.
     </div>
     <!-- The picker lists what each server told the gateway it exposes. That is the
          SERVER'S OWN CLAIM and permits nothing: it is here so a rule is written
@@ -730,7 +732,9 @@
     </table>
     <!-- Same job as `rules-empty`, and the empty case says more here: an empty egress
          policy holds everything for a human, an empty tool policy refuses everything
-         outright. -->
+         outright. The table is one server's, so the empty case also tells "no rules
+         for this server" from "no rules at all", and with no server to pick yet it
+         says the loaded rules are waiting for one (toolRulesStatus). -->
     <div class="empty" id="toolrules-empty" hidden></div>
 
     <h2>Pinned allows <span class="note" id="toolpincount"></span></h2>

@@ -324,6 +324,20 @@ export function toolPick(choices, current, origin, rulesKnown) {
   return { tool: fallback, origin: rulesKnown ? "page" : "provisional" };
 }
 
+// The rows of the tool rules table: the rules of the server picked in the form above
+// it, and no other, in the order `/api/mcp/rules` gives them. `total` counts every
+// rule loaded, and `label`, the heading's count, adds "of M" whenever the rows are not
+// all of them, so the count never reads as the whole policy when it is one server's.
+export function toolRulesShown(rules, server) {
+  const all = rules || [];
+  const rows = all.filter(r => r && r.server === server);
+  const total = all.length;
+  const n = `${rows.length} rule${rows.length === 1 ? "" : "s"}`;
+  const label = total === 0 ? "· none"
+    : rows.length === total ? `· ${n}` : `· ${n} of ${total}`;
+  return { rows, total, label };
+}
+
 // What "add rule" is about to write. A deliberately partial mirror of the backend's
 // validation, the same division of labour createPreview follows: this EXPLAINS, the
 // backend REFUSES. Only the conflict and the no-op are mirrored — both because the fix
@@ -687,11 +701,12 @@ function renderServers(rows) {
     : (rows.length ? "" :
        "No servers registered, so the gateway dials nothing. Register the container " +
        "name declared in mcp-servers.yml.");
-  // The tool-policy picker below reads THIS map for its server list, and the two
-  // refreshes race on load — so the picker is rebuilt here rather than left to wait
-  // for whichever poll happens to run next. Without it, arriving before the servers
-  // did leaves a form that says nothing is registered after everything is.
-  renderToolPicker();
+  // The tool-policy picker below reads THIS map for its server list, and the tool
+  // rules table shows the rules of the server that list has selected. The refreshes
+  // race on load — so both are redrawn here rather than left to wait for whichever
+  // poll happens to run next. Without it, arriving before the servers did leaves a
+  // form that says nothing is registered after everything is, over an empty table.
+  renderToolPolicy();
   if (editingServer !== null) renderServerPreview();
 }
 
@@ -911,8 +926,16 @@ function renderToolServerOptions() {
   if (chosen && rows.some(r => r.server === chosen)) toolRuleServer.value = chosen;
 }
 
-function renderToolPicker() {
+// The whole tool-policy block, in the one order that is right: the server options
+// first, since the table and the picker both read the select's value, and a rebuild
+// can change it (servers arriving after the rules, the selected server revoked).
+function renderToolPolicy() {
   renderToolServerOptions();
+  renderToolRules();
+  renderToolPicker();
+}
+
+function renderToolPicker() {
   const choices = toolChoices(toolRuleServer.value, inventory, toolRules);
   const chosen = toolRuleTool.value;
   toolRuleTool.replaceChildren();
@@ -981,9 +1004,12 @@ function renderToolRulePreview() {
   toolRulePreviewEl.textContent = shown.text;
 }
 
-function renderToolRules(rows) {
+function renderToolRules() {
+  const server = toolRuleServer.value;
+  const { rows, total, label } = toolRulesShown(toolRules, server);
   // Keyed by id so the click handler works from the ROW rather than parsing it back
-  // out of the DOM — the same reason the egress table keeps `rulesById`.
+  // out of the DOM — the same reason the egress table keeps `rulesById`. The drawn
+  // rows only, so a button can act only on a rule that is on screen.
   toolRulesById = new Map(rows.map(r => [String(r.id), r]));
   toolRulesBody.replaceChildren();
   for (const row of rows) {
@@ -1038,13 +1064,9 @@ function renderToolRules(rows) {
     tr.appendChild(actions);
     toolRulesBody.appendChild(tr);
   }
-  toolRuleCountEl.textContent =
-    rows.length ? `· ${rows.length} rule${rows.length === 1 ? "" : "s"}` : "· none";
-  renderListStatus(toolRulesEmpty,
-                   toolRulesStatus(rows.length, toolRulesFailed, toolRulesLoaded));
-  // The picker reads these rows for its join and its conflict check, so a rule that
-  // appeared elsewhere shows up there rather than waiting to surface as a 409.
-  renderToolPicker();
+  toolRuleCountEl.textContent = label;
+  renderListStatus(toolRulesEmpty, toolRulesStatus(rows.length, toolRulesFailed,
+                                                   toolRulesLoaded, server, total));
 }
 
 export async function refreshToolRules() {
@@ -1063,7 +1085,10 @@ export async function refreshToolRules() {
     // view exists to answer.
     toolRulesFailed = true;
   }
-  renderToolRules(toolRules);
+  // The picker reads the full `toolRules`, never the drawn rows, for its join and its
+  // conflict check, so a rule that appeared elsewhere shows up there rather than
+  // waiting to surface as a 409.
+  renderToolPolicy();
 }
 
 export async function refreshInventory() {
@@ -1080,7 +1105,7 @@ export async function refreshInventory() {
     // would be a distinction nobody could act on differently from "unknown".
     inventoryFailed = true;
   }
-  renderToolRules(toolRules);
+  renderToolPolicy();
 }
 
 function mountToolPolicy() {
@@ -1096,9 +1121,10 @@ function mountToolPolicy() {
   toolRuleCountEl = document.getElementById("toolrulecount");
 
   // Any edit invalidates the last submit's verdict — leaving it up would attach a
-  // refusal to a rule that is no longer the one on screen.
+  // refusal to a rule that is no longer the one on screen. The table follows the
+  // server select, so a change redraws it with the picker.
   for (const el of [toolRuleServer, toolRuleAction]) {
-    el.addEventListener("change", () => { toolNotice = null; renderToolPicker(); });
+    el.addEventListener("change", () => { toolNotice = null; renderToolPolicy(); });
   }
   // The one change that makes the tool the operator's choice.
   toolRuleTool.addEventListener("change", () => {

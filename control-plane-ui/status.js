@@ -83,8 +83,19 @@ const TOOL_RULES_STATUS_TEXT = {
   empty: "No tool rules, so every tool call is denied. An unconfigured tool is " +
          "refused rather than held, so nothing here reaches you to approve.",
 };
-export function toolRulesStatus(rowCount, failed, loaded) {
-  return pollStatus(TOOL_RULES_STATUS_TEXT, rowCount, failed, loaded);
+// The table shows one server's rules, the one picked in the form above it, so an
+// empty table is "no rules at all" only when `total`, every rule loaded, is 0 too. As
+// for auditStatus's filter, only the empty sentence changes: a failed load is said as
+// failed whether or not the server hides every row.
+export function toolRulesStatus(rowCount, failed, loaded, server, total) {
+  const s = pollStatus(TOOL_RULES_STATUS_TEXT, rowCount, failed, loaded);
+  if (failed || !loaded || rowCount > 0 || total === 0) return s;
+  if (server) {
+    return { ...s, text: `No tool rules for ${server}, so every call to its tools is ` +
+                         "denied. Other servers have rules: pick one above to see them." };
+  }
+  return { ...s, text: `${total} tool rule${total === 1 ? "" : "s"} loaded, shown ` +
+                       "here once a server can be picked above." };
 }
 
 // Stale is the one that matters: a pin the table no longer shows may still be

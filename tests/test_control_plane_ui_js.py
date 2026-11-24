@@ -1554,6 +1554,26 @@ console.log(JSON.stringify({
     unrecognized: m.shortActor("actor unrecorded"),
     absent: m.shortActor(undefined),
     blank: m.shortActor("   "),
+    // Forged labels, written as `_actor` writes them: the self-reported fields come
+    // after the trusted ones, and any caller can type a label into them.
+    forged_in_ua: m.shortActor(
+      'peer=172.25.0.2 via-ui=172.18.0.1 origin=http://localhost:28090 ' +
+      'ua="curl via-ui=10.9.9.9"'),
+    forged_in_origin: m.shortActor(
+      'peer=172.25.0.2 via-ui=172.18.0.1 origin=http://x via-ui=10.9.9.9 ' +
+      'peer=10.9.9.8 ua="curl/8.5.0"'),
+    // A direct caller: nothing asserted, so whatever follows `peer` is self-reported.
+    forged_direct: m.shortActor(
+      'peer=172.25.0.2 origin=http://x via-ui=10.9.9.9 ua="curl via-ui=10.9.9.8"'),
+    // A UA that closes its own quote to look like a field of its own.
+    forged_closing_quote: m.shortActor(
+      'peer=172.25.0.2 via-ui=172.18.0.1 ua="curl" via-ui=10.9.9.9"'),
+    // A header a host process set, holding a space: `_actor` writes it as it came, and
+    // only its first token is the asserted field.
+    repeated_via_ui: m.shortActor("peer=a via-ui=b via-ui=c origin=x"),
+    // The fields, but not leading: no `_actor` string starts this way, so it shows
+    // whole rather than having labels picked out of it.
+    not_leading: m.shortActor("unrecorded peer=10.9.9.9 via-ui=10.9.9.8"),
   },
 }));
 """
@@ -2379,6 +2399,26 @@ class PageScriptTests(unittest.TestCase):
         # And nothing at all reads as nothing recorded, not as a broken column.
         self.assertEqual(a["absent"], "—")
         self.assertEqual(a["blank"], "—")
+
+    def test_a_provenance_cell_reads_its_fields_by_position_not_by_label(self):
+        """`via-ui=` and `peer=` are text any caller can type into its Origin or
+        User-Agent, which `_actor` writes after the trusted fields. Picked out by label,
+        a forged `via-ui=` showed in the cell as if the relay had asserted it; only the
+        leading `peer`, and a `via-ui` straight after it, are the trusted ones."""
+        a = self.probe["actor"]
+        for case in ("forged_in_ua", "forged_in_origin", "forged_closing_quote"):
+            with self.subTest(case=case):
+                self.assertEqual(a[case], "peer=172.25.0.2 via-ui=172.18.0.1")
+                self.assertNotIn("10.9.9.", a[case])
+        self.assertEqual(a["forged_direct"], "peer=172.25.0.2")
+        self.assertEqual(a["repeated_via_ui"], "peer=a via-ui=b")
+
+    def test_provenance_fields_that_do_not_lead_are_shown_whole_not_picked(self):
+        # Every `_actor` string from a request starts with `peer=`, so only this case
+        # holds the start anchor: labels later in an unrecognized string are not
+        # fields at all.
+        a = self.probe["actor"]
+        self.assertEqual(a["not_leading"], "unrecorded peer=10.9.9.9 via-ui=10.9.9.8")
 
     def test_sibling_hosts_fold_under_their_registrable_domain(self):
         g = self.probe["group"]["siblings"]

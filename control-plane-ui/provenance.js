@@ -20,14 +20,20 @@
 // `_actor` labels its fields. A cell reading `172.18.0.1` presents an assertion as a
 // fact; `via-ui=172.18.0.1` does not.
 //
+// READ BY POSITION, NOT BY LABEL: `_actor` writes the fields it observes or the relay
+// asserts first (`peer=`, then `via-ui=`) and the forgeable `origin=` and `ua=` after
+// them. A label is text any caller can type into its Origin or User-Agent, so only
+// position tells a relayed address from a claimed one: the cell keeps the leading
+// `peer=` token, and a `via-ui=` token only when it comes straight after it.
+//
 // The full string still goes in the cell's `title`, and the audit record is untouched:
 // this shortens a rendering, never the stored value.
 export function shortActor(actor) {
   const s = (actor || "").trim();
   if (!s) return "—";
-  const kept = s.match(/\b(?:peer|via-ui)=\S+/g);
+  const kept = s.match(/^peer=\S+(?: via-ui=\S+)?/);
   // An unrecognized shape falls back to the whole string rather than to nothing — a
   // provenance cell that silently emptied itself would be worse than a wide one, and
   // the CSS width cap catches whatever length arrives.
-  return kept ? kept.join(" ") : s;
+  return kept ? kept[0] : s;
 }

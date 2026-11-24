@@ -101,6 +101,8 @@ class RelayAllowlistTests(unittest.TestCase):
                              ("api/mcp/rules", "POST"),
                              ("api/mcp/rules/12/edit", "POST"),
                              ("api/mcp/rules/12/revoke", "POST"),
+                             # The policy export, a read.
+                             ("api/mcp/export", "GET"),
                              # Pins: read, and taken back, which only narrows.
                              ("api/mcp/pins", "GET"),
                              ("api/mcp/pins/12/revoke", "POST")):
@@ -200,6 +202,13 @@ class RelayAllowlistTests(unittest.TestCase):
                              # it would be a browser pushing a server's surface into the
                              # control plane, which only the gateway may do.
                              ("api/mcp/inventory", "POST"),
+                             # The export is a read, and its entry is anchored: no
+                             # write, and nothing under or beside it.
+                             ("api/mcp/export", "POST"),
+                             ("api/mcp/export/", "GET"),
+                             ("api/mcp/export/x", "GET"),
+                             ("api/mcp/export.json", "GET"),
+                             ("api/mcp/exports", "GET"),
                              # No collection POST: a pin is written by resolving a
                              # card, never from a form. The id is digit-bounded as the
                              # rule ids are.

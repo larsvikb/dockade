@@ -185,6 +185,9 @@ _RELAY_ROUTES = (
     # from, and a server that invents one gets it listed, never permitted.
     ("GET", re.compile(r"^/api/mcp/inventory$")),
     ("GET", re.compile(r"^/api/mcp/rules$")),
+    # The rules and registrations as a file to save (control-plane/DESIGN.md, "The
+    # policy export"). A read, and anchored as the views above are.
+    ("GET", re.compile(r"^/api/mcp/export$")),
     # This one GRANTS, and it is the widest thing on this list by consequence: an
     # `allow` here lets the agent call that tool with no hold and no click, on a
     # surface whose payloads are arbitrary JSON. Same class as `POST

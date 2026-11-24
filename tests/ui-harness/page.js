@@ -396,6 +396,11 @@ export async function openPage(browser, uiDir, { respond, answeredLast = () => f
     }
     // A request the network drops, so the page's `fetch` throws.
     if (answer.abort) return await route.abort();
+    // Raw bytes, sent as given, for an answer the page must not see re-serialized.
+    if ("body" in answer) {
+      return await route.fulfill({ status: answer.status, body: answer.body,
+                                   contentType: answer.contentType });
+    }
     await route.fulfill({ status: answer.status, json: answer.json });
   }, line => log.push(line), line => unanswered.push(line), { last: answeredLast });
 

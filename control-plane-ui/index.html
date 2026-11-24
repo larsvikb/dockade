@@ -608,6 +608,13 @@
       enabling does not permit: a server with no tool rules denies every call, because
       an unconfigured tool is denied rather than held.
     </div>
+    <!-- Every tool rule and registration as a JSON file (control-plane/DESIGN.md, "The
+         policy export"). Above the forms, since it is about the whole tab. Its status
+         line says only why an export failed. -->
+    <div class="ruleform">
+      <button type="button" id="mcp-export">Export policy (JSON)</button>
+      <span class="note" id="mcp-export-status" role="status"></span>
+    </div>
     <!-- The name is typed, and is NOT checked against anything: this container cannot
          enumerate what is running (that would mean a docker socket on the crown jewel),
          so a typo registers a server the gateway finds nothing behind. That is the

@@ -267,7 +267,7 @@ const owner = {
              "serverEditPreview", "serverEditBody", "serverSaveBody",
              "toolChoices", "toolRulePreview", "toolEditPreview", "toolRevokePreview",
              "pinText", "pinState", "pinReach", "pinExpiry", "pinLapsesDue",
-             "toolArgsChanged", "toolPick", "toolPreviewShown"],
+             "toolArgsChanged", "toolPick", "toolPreviewShown", "exportFileName"],
   "leases.js": ["leaseLabel", "leaseRemaining", "leaseCountdown", "leaseDomain",
                 "groupLeases"],
   "status.js": ["auditStatus", "rulesStatus", "toolRulesStatus", "toolPinsStatus",
@@ -3883,6 +3883,38 @@ class ToolArgsChangedTests(unittest.TestCase):
         self.assertIn("+ `${item.argsChanged ? `, ${item.argsChanged}` : \"\"}`", picker)
 
 
+_EXPORT_NAME_PROBE = r"""
+import { pathToFileURL } from "node:url";
+const m = await import(pathToFileURL(`${process.env.DOCKADE_UI_DIR}/mcp.js`).href);
+console.log(JSON.stringify({
+  // 23:30 UTC on 1 January is 00:30 on the 2nd in Stockholm.
+  across: m.exportFileName(Date.UTC(2026, 0, 1, 23, 30)),
+  late: m.exportFileName(Date.UTC(2026, 10, 21, 12, 0)),
+}));
+"""
+
+
+@unittest.skipIf(not _NODE and not _STRICT,
+                 "node is not installed — skipping the export file name tests")
+class ExportFileNameTests(unittest.TestCase):
+    """The policy export's file name, dated by the page's local day, at an instant
+    whose UTC day is another, under the runner's pinned zone."""
+
+    def test_the_name_carries_the_local_date(self):
+        if not _NODE:
+            raise AssertionError("node is not installed and DOCKADE_REQUIRE_TOOLS is set")
+        proc = subprocess.run(  # noqa: S603 (absolute path, fixed args)
+            [_NODE, "--input-type=module", "-e", _EXPORT_NAME_PROBE],
+            env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir()),
+                 "TZ": "Europe/Stockholm"},
+            capture_output=True, text=True, timeout=60, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"node could not run the export probe:\n{proc.stderr}")
+        self.assertEqual(json.loads(proc.stdout),
+                         {"across": "dockade-mcp-policy-2026-01-02.json",
+                          "late": "dockade-mcp-policy-2026-11-21.json"})
+
+
 #: Every file whose code puts a value in the audit table's `stage` column: the callers
 #: of ``store._audit`` and the store's own SQL, the proxy (its rows reach the column
 #: through `/authorize` or through ingest) and the gateway's outcome line (ingest).
@@ -5893,7 +5925,7 @@ class CallSiteSourceTests(unittest.TestCase):
 _BROWSER_GLOBALS = frozenset({
     "Array", "Boolean", "Date", "Error", "EventSource", "JSON", "Map", "Math", "NaN",
     "Notification", "Number", "Object", "Set", "String", "URLSearchParams",
-    "clearTimeout", "document", "encodeURIComponent", "fetch", "location",
+    "URL", "clearTimeout", "document", "encodeURIComponent", "fetch", "location",
     "performance", "setInterval", "setTimeout", "window",
 })
 

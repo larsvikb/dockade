@@ -520,15 +520,63 @@ export function pinState(pin) {
   return { live: false, text: `${server} is disabled, so this decides nothing` };
 }
 
+// The name the policy export is saved under, dated by the page's LOCAL day at
+// `nowMs`: the day the operator saved it, which is what they will look for.
+export function exportFileName(nowMs) {
+  const d = new Date(nowMs);
+  const pad = n => String(n).padStart(2, "0");
+  return `dockade-mcp-policy-${d.getFullYear()}-${pad(d.getMonth() + 1)}-`
+    + `${pad(d.getDate())}.json`;
+}
+
 // ── the MCP tab ──────────────────────────────────────────────────────────────
 // The DOM half of this surface, wired by `mountMcp`, which `start()` calls. The
 // elements are looked up there rather than at import, so the node tests can still
 // import this file with no DOM.
 
 export function mountMcp() {
+  mountExport();
   mountServers();
   mountToolPolicy();
   mountPins();
+}
+
+// ── the policy export ────────────────────────────────────────────────────────
+// Every tool rule and registration as a file (control-plane/DESIGN.md, "The policy
+// export"). Saved as the bytes served, never parsed and re-serialized.
+let exportButton, exportStatus;
+
+async function exportPolicy() {
+  exportButton.disabled = true;
+  exportStatus.textContent = "";
+  try {
+    const res = await fetch("/api/mcp/export");
+    if (!res.ok) {
+      exportStatus.textContent =
+        `Could not export: the control plane answered HTTP ${res.status}.`;
+      return;
+    }
+    const url = URL.createObjectURL(await res.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = exportFileName(Date.now());
+    document.body.append(link);
+    link.click();
+    link.remove();
+    // Revoked later rather than now, as a precaution: the browser reads the blob after
+    // the click, and the delay leaves it time to.
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) {
+    exportStatus.textContent = "Could not export: the control plane is unreachable.";
+  } finally {
+    exportButton.disabled = false;
+  }
+}
+
+function mountExport() {
+  exportButton = document.getElementById("mcp-export");
+  exportStatus = document.getElementById("mcp-export-status");
+  exportButton.addEventListener("click", exportPolicy);
 }
 
 // ── MCP servers: the table and its form ──────────────────────────────────────

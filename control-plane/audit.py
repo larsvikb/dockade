@@ -70,10 +70,15 @@ KINDS = ("allow", "deny", "hold", "revoke", "create", "edit", "observe",
 # ``result_sha256`` is in the record view alone, because only its request cell shows
 # the whole hash (``resultFacts`` in control-plane-ui/audit.js): an operator holding
 # the key to a tool call's content file finds the row it came from.
+#
+# ``repo`` is in both, as both views serve it, and is the one exception while the page
+# does not yet draw it: a search can then match a repo row on a cell left off screen.
+# No repo row exists until the git service asks, which is built after the page.
 GROUPED_SEARCH = ("host", "client", "client_class", "actor", "reason",
-                  "server", "tool", "status")
+                  "server", "tool", "status", "repo")
 EVENT_SEARCH = ("host", "client", "client_class", "actor", "reason", "method",
-                "url", "server", "tool", "status", "approval_id", "result_sha256")
+                "url", "server", "tool", "status", "approval_id", "result_sha256",
+                "repo")
 
 # Columns the record view serves. Deliberately the whole row: this is the view the
 # glance defers to, so the fields it drops as noise or as unbounded (``url`` above
@@ -90,7 +95,10 @@ EVENT_COLUMNS = ("id", "ts", "kind", "stage", "host", "port", "proto", "client",
                  # what finds its body in the gateway's own file.
                  "result_bytes", "result_sha256", "duration",
                  # Which handle named the card; why, at its DDL in ``store._init_db``.
-                 "settled_by")
+                 "settled_by",
+                 # Which repo a git-surface row concerns, its identity as the tool
+                 # columns are a tool row's.
+                 "repo")
 
 # Bound on the search needle. Not a security control — the store's own write cap
 # (``store.DRAIN_MAX_FIELD``) is what keeps the COLUMNS bounded — but a LIKE pattern
@@ -273,8 +281,9 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     The group key is the DISPLAYED fields, plus one that is not: ``approval_id``, on
     a row without a host.
 
-    The displayed part is why the tool columns are in it — two `ok` outcomes for
-    different tools are different facts, and folding them on `reason` alone (both NULL)
+    The displayed part is why the tool columns and ``repo`` are in it — two `ok`
+    outcomes for different tools are different facts, as are two allows of two repos
+    under one `owner/*` rule, and folding them on `reason` alone (both NULL)
     would show one row saying "2x" with no way to say what it stood for. Egress rows
     carry NULL in all of them and SQLite groups NULLs together, so they fold as if the
     tool columns were absent.
@@ -290,7 +299,8 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     happened. A pin is the other side of the same rule: it answers many calls under the
     one decision that made it, so its allows and their outcomes share an id and fold.
     Outcomes with no approval still fold (NULLs group together), which keeps the
-    high-volume read-only rows quiet.
+    high-volume read-only rows quiet. A repo row is never host-less: its ``host`` is
+    ``policy.REPO_HOST``, so it folds as an egress row does, by what it displays.
     Egress rows carry their card's id too, for the record view's search, and still
     fold: the id is in the key only for a row without a host. A retried request raises
     a fresh card per hold window, so splitting on it would turn one agent retrying one
@@ -312,11 +322,11 @@ def grouped(conn, limit: int, filt: Filter, scan: int) -> list:
     `ts` index to the end of the table. Bounded by the table, not by ``scan``."""
     return conn.execute(
         "SELECT kind, stage, host, client, client_class, actor, reason, "  # noqa: S608
-        "       server, tool, status, "
+        "       server, tool, status, repo, "
         "       COUNT(*) AS n, MAX(ts) AS ts, MIN(ts) AS first_ts "
         f"FROM (SELECT * FROM audit {filt.where} ORDER BY ts DESC LIMIT ?) "
         "GROUP BY kind, stage, host, client, client_class, actor, reason, "
-        "         server, tool, status, "
+        "         server, tool, status, repo, "
         "         CASE WHEN host IS NULL THEN approval_id END "
         "ORDER BY ts DESC LIMIT ?",
         [*filt.params, scan, limit]).fetchall()

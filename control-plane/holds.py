@@ -8,6 +8,9 @@ bound it, the grouping that collapses a retry storm into one card, and the
 saturation counters the UI's banner reads — but not the endpoints that drive it,
 which are in the ``api_*`` modules.
 
+A held git fetch blocks the same way, through ``_authorize_repo``: the REPO HOLDS
+reuse this registry whole, with their own tables and a group key of their own kind.
+
 SINGLE PROCESS ONLY. Every dict below is in-memory, so a held ``/authorize`` and
 the ``api_approvals.resolve`` that releases it must share memory (see the ``app.py``
 module docstring). The Event only WAKES the blocked worker; the human's decision is
@@ -118,8 +121,13 @@ _SATURATION: dict[str, object] = {
 
 
 def _group_key(client: str | None, host: str | None,
-               port: int | None, proto: str | None) -> tuple:
+               port: int | None, proto: str | None, kind: str = "egress") -> tuple:
     """What makes two held requests THE SAME REQUEST for grouping purposes.
+
+    ``kind`` is the surface that held it, `egress` or `repo`, so a repo hold never
+    joins an egress hold: an egress host is the agent's word, and one spelled as a repo
+    path (``github.com/acme/widgets``, no port, no proto) would otherwise share a key
+    with the repo card and inherit its answer. A repo hold passes its repo as ``host``.
 
     ``client`` is in the key because a card names one client, and approving one
     sandbox's request must not silently release another's.
@@ -133,7 +141,7 @@ def _group_key(client: str | None, host: str | None,
     collapses (a query string, a cache-buster). Every joined request still writes its
     own audit line with its own method and url (``api_authorize.authorize``); only the
     CARD shows one representative."""
-    return ((client or None), (host or "").lower(),
+    return (kind, (client or None), (host or "").lower(),
             port, (proto or "").lower() or None)
 
 
@@ -159,7 +167,8 @@ class HoldSlot(NamedTuple):
 
 def _reserve_hold(approval_id: str, event: threading.Event,
                   client: str | None, host: str | None = None,
-                  port: int | None = None, proto: str | None = None) -> HoldSlot:
+                  port: int | None = None, proto: str | None = None,
+                  kind: str = "egress") -> HoldSlot:
     """Atomically check the hold caps and either reserve a slot for a NEW card, attach
     this request to an existing card for the same key, or refuse.
 
@@ -181,7 +190,7 @@ def _reserve_hold(approval_id: str, event: threading.Event,
     "over the cap" is the one place that reports it. The scope string names WHICH of
     the four fired: "one agent is hammering" and "the whole control plane is loaded"
     want different responses from the operator."""
-    key = _group_key(client, host, port, proto)
+    key = _group_key(client, host, port, proto, kind)
     with _LOCK:
         def refuse(scope: str) -> HoldSlot:
             _SATURATION["count"] = int(_SATURATION["count"]) + 1  # type: ignore[arg-type]
@@ -303,13 +312,14 @@ def _release_hold(approval_id: str) -> None:
 
 
 def _expire_orphaned_holds() -> int:
-    """Retire every egress card a previous process left pending. Returns how many.
+    """Retire every blocking card a previous process left pending, egress and repo.
+    Returns how many.
 
     Called once at boot, before any listener binds. A held request cannot survive a
-    restart: its blocked connection is gone, and the proxy records it as a fail-closed
-    deny unless the proxy went down too. The card is what is left, retired here with an
-    AUDIT ROW per card, as ``_expire_tool_asks`` writes one per lapsed ask, so the
-    trail can say what became of a card the operator saw disappear.
+    restart: its blocked connection is gone, and the proxy or the git service records
+    it as a fail-closed deny unless it went down too. The card is what is left, retired
+    here with an AUDIT ROW per card, as ``_expire_tool_asks`` writes one per lapsed ask,
+    so the trail can say what became of a card the operator saw disappear.
 
     ``tool_approvals`` is NOT swept: nothing blocks on a tool ask, so a pending one is
     still a live question an agent can come back for. Its own ``deadline`` ends it.
@@ -321,20 +331,28 @@ def _expire_orphaned_holds() -> int:
         due = conn.execute(
             "SELECT id, host, port, proto, client, client_class, method, url "
             "FROM approvals WHERE status='pending'").fetchall()
-        # One UPDATE for the rows just read, with nothing between them: no listener
-        # has bound yet, so nothing else can be writing this table.
-        conn.execute("UPDATE approvals SET status='expired', resolved_at=? "
-                     "WHERE status='pending'", (now,))
+        repos = conn.execute(
+            "SELECT id, repo, client, client_class FROM repo_approvals "
+            "WHERE status='pending'").fetchall()
+        # One UPDATE per table for the rows just read, with nothing between them: no
+        # listener has bound yet, so nothing else can be writing either table.
+        for table in ("approvals", "repo_approvals"):
+            conn.execute(f"UPDATE {table} SET status='expired', resolved_at=? "  # noqa: S608
+                         "WHERE status='pending'", (now,))      # a literal of the tuple
         conn.commit()
+    why = ("left pending by a previous control-plane process — default-deny; nothing "
+           "is left to answer it, and its held requests went down with that process")
     for row in due:
         store._audit("deny", stage="boot-sweep", host=row["host"], port=row["port"],
                      proto=row["proto"], client=row["client"],
                      client_class=row["client_class"], method=row["method"],
-                     url=row["url"], approval_id=row["id"],
-                     reason="left pending by a previous control-plane process — "
-                            "default-deny; nothing is left to answer it, and its "
-                            "held requests went down with that process")
-    return len(due)
+                     url=row["url"], approval_id=row["id"], reason=why)
+    for row in repos:
+        store._audit("deny", stage="boot-sweep", host=policy.REPO_HOST,
+                     repo=row["repo"], client=row["client"],
+                     client_class=row["client_class"], approval_id=row["id"],
+                     reason=why)
+    return len(due) + len(repos)
 
 
 def _classified(client_class: str | None) -> bool:
@@ -377,7 +395,7 @@ def _list_pending() -> list[dict]:
     #       (``_classified``). Two fields for one condition, so the payload says what
     #       each button needs and the page need not know they share it.
     #   ``kind``  what the merged queue dispatches on (``_pending_payload``), stated on
-    #       both builders so neither surface is the implicit one.
+    #       every builder so no surface is the implicit one.
     #
     # A lease needs no options field: its host is the requested one and its duration
     # is the same for every card (``policy.LEASE_SECONDS``), which is why the lease
@@ -388,6 +406,185 @@ def _list_pending() -> list[dict]:
                  persist_options=[{"pattern": p, "scope": policy._pattern_scope(p),
                                    "existing": rules.get((p, r["client_class"]))}
                                   for p in policy._persist_candidates(r["host"])])
+            for r in rows]
+
+
+# ── repo holds — a git fetch, held as egress is ─────────────────────────────
+#
+# The governed git service asks per repo (control-plane/DESIGN.md, "The repo
+# surface"). Its holds BLOCK, as egress holds do, so they reuse the registry above
+# whole: the caps, the deadline, the grouping (tagged `repo`), the saturation account.
+# Their rim is their own: the repo tables, a card with no allow-once, and an upload
+# that is never held. No route calls this yet; the git service's bridge will.
+
+#: The one git service the surface allows, a fetch. A push (`git-receive-pack`) is
+#: the MCP gateway's (DESIGN.md, "The MCP gateway owns repo writes").
+REPO_SERVICE = "git-upload-pack"
+#: The two requests of one fetch: ``advertise``, the `info/refs` GET, which may be
+#: held, and ``upload``, the upload-pack POSTs after it, which never are.
+REPO_STAGES = ("advertise", "upload")
+
+
+class RepoAnswer(NamedTuple):
+    """What the git service is told: allow or deny, the reason the audit row carries,
+    and with a deny the ``refusal`` ``api_authorize.AuthorizeResponse`` documents
+    (`policy`, `unanswered`, `busy`); None on an allow."""
+    decision: str
+    reason: str
+    refusal: str | None
+
+
+def _repo_scope_words(row) -> str:
+    """How far a human's answer on a repo card reached, from its durable ``mode``, for
+    the reason a released waiter writes: ``api_authorize._decision_scope`` for the
+    repo card, whose narrowest answer is `deny_once`."""
+    mode = row["mode"]
+    if mode == "persist":
+        return f"standing rule written: {row['pattern']}"
+    if mode == "present":
+        return f"standing rule already in place: {row['pattern']}"
+    if mode == "lease":
+        return f"lease written, {policy._short_duration(policy.LEASE_SECONDS)}"
+    return "this fetch only"
+
+
+def _authorize_repo(client: str | None, repo: str, service: str,
+                    stage: str) -> RepoAnswer:
+    """Decide one request of a git fetch: ``client`` the peer address the git service
+    saw, ``repo`` as its URL path named it, ``service`` the git service asked for, and
+    ``stage`` which request of the fetch this is (``REPO_STAGES``). Every answer is
+    audited, with the repo.
+
+    Refused at once, each an audited deny: a field with a lone surrogate, any service
+    but ``REPO_SERVICE``, an unknown stage, a repo ``policy._normalize_repo`` refuses,
+    and an unclassified client. That last raises no card, because the only answers a
+    card offers it are denials: a lease and a rule both need a class, and a repo card
+    has no allow-once.
+
+    Otherwise ``policy._repo_ruling`` decides. What it leaves undecided is HELD on
+    ``advertise``, blocking until a human answers or ``HOLD_TIMEOUT`` default-denies,
+    exactly as ``api_authorize.authorize`` holds; on ``upload`` it is DENIED, with no
+    card. A fetch's POSTs follow its advertisement within seconds, under the grant its
+    card wrote, so an upload with no grant behind it is one whose lease ran out
+    between the two, or one sent without asking, and neither is a question."""
+    client_class = policy._client_class(client)
+    if store._unencodable(client, repo, service, stage):
+        normal, why_not = None, store.UNENCODABLE
+    else:
+        normal, why_not = policy._normalize_repo(repo)
+    where = dict(host=policy.REPO_HOST, repo=normal or repo, client=client,
+                 client_class=client_class)
+    # The audit stage is this surface's own literal, never the caller's word, so the
+    # page can name every stage written (``AuditStageGuardTests``); an unknown stage is
+    # quoted in the reason that refuses it.
+    if stage == "advertise":
+        where.update(stage="git-advertise")
+    elif stage == "upload":
+        where.update(stage="git-upload")
+    else:
+        where.update(stage="git")
+
+    def refused(reason: str, refusal: str = "policy") -> RepoAnswer:
+        store._audit("deny", **where, reason=reason)
+        return RepoAnswer("deny", reason, refusal)
+
+    if why_not == store.UNENCODABLE:
+        return refused(why_not)
+    if service != REPO_SERVICE:
+        return refused(f"git service {policy._quoted(service)} is refused; the git "
+                       f"surface serves {REPO_SERVICE}, a fetch, only, and a push is "
+                       f"the MCP gateway's")
+    if stage not in REPO_STAGES:
+        return refused(f"stage {policy._quoted(stage)} is not one of "
+                       f"{', '.join(REPO_STAGES)}")
+    if normal is None:
+        return refused(why_not)
+    if not _classified(client_class):
+        return refused("this fetch came from an unclassified client, and a repo card "
+                       "could only deny it: a lease and a rule need a class, and a repo "
+                       "card has no allow-once. Map its network in "
+                       "CONTROL_CLIENT_CLASSES.")
+    decision, reason, lease_card = policy._repo_ruling(normal, client_class)
+    if decision in ("allow", "deny"):
+        store._audit(decision, **where, approval_id=lease_card, reason=reason)
+        return RepoAnswer(decision, reason, "policy" if decision == "deny" else None)
+    if stage == "upload":
+        return refused(f"no rule or lease allows {normal} for client class "
+                       f"{client_class}, and an upload is never held; the next "
+                       f"fetch's advertisement raises a card")
+
+    slot = _reserve_hold(uuid.uuid4().hex, threading.Event(), client, normal,
+                         kind="repo")
+    if slot.refused is not None:
+        return refused(slot.refused, "busy")
+    approval_id, event = slot.approval_id, slot.event
+    # Reserved from here, and the `finally` gives it back, for the reason
+    # ``api_authorize._answer`` gives at the same point.
+    try:
+        if not slot.joined:
+            with store._connect() as conn:
+                conn.execute(
+                    "INSERT INTO repo_approvals(id, ts, repo, client, client_class, "
+                    "status) VALUES (?,?,?,?,?, 'pending')",
+                    (approval_id, time.time(), normal, client, client_class))
+                conn.commit()
+        store._audit("hold", **where, approval_id=approval_id,
+                     reason=(f"joined hold {approval_id} — duplicate of a fetch "
+                             f"already awaiting approval" if slot.joined
+                             else "held for approval"))
+        # The card's remaining window. The durable row is the outcome: this expiry and
+        # ``resolve`` each flip it out of 'pending' conditionally, so exactly one of
+        # them decides (``api_authorize._answer``).
+        event.wait(max(0.0, slot.deadline - time.time()))
+        with store._connect() as conn:
+            expired = conn.execute(
+                "UPDATE repo_approvals SET status='expired', resolved_at=? "
+                "WHERE id=? AND status='pending'", (time.time(), approval_id)).rowcount
+            row = None if expired else conn.execute(
+                "SELECT status, mode, resolved_by, pattern FROM repo_approvals "
+                "WHERE id=?", (approval_id,)).fetchone()
+            conn.commit()
+        if expired:
+            _close_group(approval_id)
+    finally:
+        _release_hold(approval_id)
+
+    status = "expired" if row is None else row["status"]
+    if status == "expired":
+        final, why, refusal = ("deny", "no decision within hold timeout — default-deny",
+                               "unanswered")
+    elif status == "allowed":
+        final, why, refusal = "allow", f"human approval ({_repo_scope_words(row)})", None
+    else:
+        final, why, refusal = ("deny", f"human rejection ({_repo_scope_words(row)})",
+                               "policy")
+    store._audit(final, **where, actor=row["resolved_by"] if row else None,
+                 approval_id=approval_id, reason=why)
+    return RepoAnswer(final, why, refusal)
+
+
+def _list_repo_holds() -> list[dict]:
+    """Pending repo cards, oldest first: the third builder behind the one queue.
+
+    The egress card's rim (``_list_pending``) over the repo tables: ``requests``,
+    ``persist_options`` from ``policy._repo_candidates`` with each one's ``existing``
+    action, and ``persistable`` and ``leasable``. What ``resolve`` takes on a repo card
+    is ``api_approvals.REPO_ACTIONS``, which has no allow-once."""
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT id, ts, repo, client, client_class FROM repo_approvals "
+            "WHERE status='pending' ORDER BY ts").fetchall()
+        rules = {(r["pattern"], r["client_class"]): r["action"]
+                 for r in conn.execute(
+                     "SELECT pattern, action, client_class FROM repo_rules")}
+    with _LOCK:
+        waiters = dict(_PENDING_WAITERS)
+    return [dict(r, kind="repo", requests=max(1, waiters.get(r["id"], 1)),
+                 persistable=_classified(r["client_class"]),
+                 leasable=_classified(r["client_class"]),
+                 persist_options=[{"pattern": p, "scope": policy._repo_scope(p),
+                                   "existing": rules.get((p, r["client_class"]))}
+                                  for p in policy._repo_candidates(r["repo"])])
             for r in rows]
 
 
@@ -418,8 +615,8 @@ TOOL_HOLD_TIMEOUT = float(os.environ.get("CONTROL_TOOL_HOLD_TIMEOUT", "3600"))
 # deciding is slow, and a gateway that already has its answer is not. Read by the
 # grant parser, not as a bare float like the bounds beside it: a large value widens.
 TOOL_GRANT_TIMEOUT = policy._grant_seconds("CONTROL_TOOL_GRANT_TIMEOUT", "900")
-# The card caps, tool-side. Their own numbers, since the two surfaces share no pool
-# and a queue of asks costs no workers.
+# The card caps, tool-side. Their own numbers, since tool asks share no pool with the
+# blocking holds, egress and repo, and a queue of asks costs no workers.
 MAX_TOOL_PENDING = int(os.environ.get("CONTROL_MAX_TOOL_PENDING", "12"))
 MAX_TOOL_PENDING_PER_CLIENT = int(
     os.environ.get("CONTROL_MAX_TOOL_PENDING_PER_CLIENT", "4"))
@@ -662,7 +859,7 @@ def _refuse_tool(scope: str, detail: str = "") -> ToolAsk:
     """Record an over-cap tool ask in the ONE saturation account and refuse it.
     Caller holds ``_LOCK``.
 
-    One account for both surfaces, so an operator reads one banner. ``last_host`` is
+    One account for every surface, so an operator reads one banner. ``last_host`` is
     left alone: the banner's subject field is host-shaped, and the scope string says
     what this was. ``detail`` reaches the refusal only, since it may be relative to
     now and the account outlives the moment."""
@@ -1180,14 +1377,15 @@ def _pending_payload() -> dict:
     emits on change, so a rejection reaches the banner within a second through the
     push the page already listens to.
 
-    **ONE list over two builders**, where everything else about tool policy splits:
+    **ONE list over three builders**, egress, repo and tool, where everything else
+    about the surfaces splits:
     two streams merged in the browser would render a silent subset when one dropped,
     and a subset of a queue looks exactly like an empty one (control-plane/DESIGN.md,
     "`approvals` splits the same way; the operator's queue does not").
 
-    Ordered by ``ts`` ACROSS the two, because the operator's question is which
+    Ordered by ``ts`` ACROSS them, because the operator's question is which
     decision has waited longest, whichever subsystem raised it."""
-    holds_and_asks = _list_pending() + _list_tool_asks()
+    holds_and_asks = _list_pending() + _list_repo_holds() + _list_tool_asks()
     holds_and_asks.sort(key=lambda card: card["ts"])
     # Read AFTER the queue: a withdrawal landing between the two reads then puts an id
     # in both lists, which is harmless, rather than in neither, which would leave its

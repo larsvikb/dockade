@@ -167,6 +167,7 @@ REFFILES := $(SCRIPTS) \
             control-plane/api_tool.py \
             control-plane/api_approvals.py \
             control-plane/api_egress.py \
+            control-plane/api_repos.py \
             control-plane/api_mcp.py \
             control-plane/api_views.py \
             control-plane/requirements.txt \

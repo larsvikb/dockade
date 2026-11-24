@@ -1230,7 +1230,7 @@ class _ToolAskTestCase(unittest.TestCase):
     """Fixture for tool asks. Deliberately NOT ``_HoldRegistryTestCase``: there is no
     in-memory registry to wipe, because nothing blocks on a tool ask and the row is
     the whole of it. What does need resetting is the table, the two caps, the window,
-    and the saturation account the two surfaces share."""
+    and the saturation account every surface shares."""
 
     CAPS: ClassVar[tuple] = ("MAX_TOOL_PENDING", "MAX_TOOL_PENDING_PER_CLIENT",
                              "TOOL_HOLD_TIMEOUT", "TOOL_GRANT_TIMEOUT",
@@ -1922,6 +1922,7 @@ class OrphanedHoldSweepTests(_ToolAskTestCase):
     def _wipe_cards():
         with cp.store._connect() as conn:
             conn.execute("DELETE FROM approvals")
+            conn.execute("DELETE FROM repo_approvals")
             conn.commit()
 
     @staticmethod
@@ -1994,6 +1995,47 @@ class OrphanedHoldSweepTests(_ToolAskTestCase):
         cp.holds._expire_orphaned_holds()
         self.assertEqual(cp.holds._expire_orphaned_holds(), 0)
         self.assertEqual(len(self._audit_rows("orphan-3")), 1)
+
+    @staticmethod
+    def _repo_card(approval_id, status="pending"):
+        with cp.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO repo_approvals(id, ts, repo, client, client_class, status) "
+                "VALUES (?, 0, 'github.com/acme/widgets', '172.30.0.7', 'sandbox', ?)",
+                (approval_id, status))
+            conn.commit()
+
+    def test_a_pending_repo_card_is_expired_and_leaves_a_deny_row_with_its_repo(self):
+        # A held fetch blocks as a held request does, so a restart orphans it too.
+        self._repo_card("repo-orphan")
+        self._card("orphan-beside")
+        self.assertEqual(cp.holds._expire_orphaned_holds(), 2)
+        with cp.store._connect() as conn:
+            status = conn.execute("SELECT status, resolved_at FROM repo_approvals "
+                                  "WHERE id='repo-orphan'").fetchone()
+            row = dict(conn.execute(
+                "SELECT kind, stage, host, repo, client, client_class, reason "
+                "FROM audit WHERE approval_id='repo-orphan'").fetchone())
+        self.assertEqual(status["status"], "expired")
+        self.assertIsNotNone(status["resolved_at"])
+        self.assertEqual({k: row[k] for k in ("kind", "stage", "host", "repo", "client",
+                                              "client_class")},
+                         {"kind": "deny", "stage": "boot-sweep", "host": "github.com",
+                          "repo": "github.com/acme/widgets", "client": "172.30.0.7",
+                          "client_class": "sandbox"})
+        self.assertIn("previous control-plane process", row["reason"])
+
+    def test_a_decided_repo_card_is_left_alone(self):
+        for status in ("allowed", "denied", "expired"):
+            self._repo_card(f"repo-{status}", status=status)
+        self.assertEqual(cp.holds._expire_orphaned_holds(), 0)
+        with cp.store._connect() as conn:
+            self.assertEqual(
+                sorted(r[0] for r in conn.execute("SELECT status FROM repo_approvals")),
+                ["allowed", "denied", "expired"])
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM audit WHERE approval_id LIKE 'repo-%'"
+            ).fetchone()[0], 0)
 
     def test_boot_runs_the_sweep(self):
         # The wiring: ``_bootstrap`` is what a restart actually runs.
@@ -2165,6 +2207,223 @@ class OwnStoreTests(unittest.TestCase):
     def test_the_store_is_this_modules_own(self):
         self.assertEqual(cp.store.DB_PATH, _DB)
         self.assertEqual(cp.store.SEED_PATH, _SEED)
+
+
+
+def _set_repo_rules(rules):
+    """(pattern, action) or (pattern, action, client_class) repo rules, replacing all."""
+    with cp.store._connect() as conn:
+        conn.execute("DELETE FROM repo_rules")
+        conn.executemany(
+            "INSERT INTO repo_rules(pattern, action, source, created_at, client_class) "
+            "VALUES (?,?, 'test', 0, ?)",
+            [r if len(r) == 3 else (*r, CLASS) for r in rules])
+        conn.commit()
+
+
+def _set_repo_leases(leases):
+    """(repo, seconds from now) or (repo, seconds, client_class) repo leases."""
+    now = time.time()
+    with cp.store._connect() as conn:
+        conn.execute("DELETE FROM repo_leases")
+        conn.executemany(
+            "INSERT INTO repo_leases(repo, client_class, approval_id, created_at, "
+            "expires_at, granted_by) VALUES (?,?,?,?,?, 'test')",
+            [(lease[0], lease[2] if len(lease) == 3 else CLASS, f"card-{i}", now,
+              now + lease[1]) for i, lease in enumerate(leases)])
+        conn.commit()
+
+
+class RepoNormaliserTests(unittest.TestCase):
+    """``policy._normalize_repo``: the one form a repo is compared, stored and leased
+    in, and every shape it refuses rather than repairs."""
+
+    def test_case_folds_and_one_dot_git_goes(self):
+        for raw, want in (("github.com/acme/widgets", "github.com/acme/widgets"),
+                          ("GitHub.com/Acme/Widgets", "github.com/acme/widgets"),
+                          ("github.com/acme/widgets.git", "github.com/acme/widgets"),
+                          ("github.com/acme/WIDGETS.GIT", "github.com/acme/widgets"),
+                          # One, not every: `widgets.git` is a name GitHub allows.
+                          ("github.com/acme/widgets.git.git",
+                           "github.com/acme/widgets.git"),
+                          ("github.com/a-b/x_y.z", "github.com/a-b/x_y.z")):
+            with self.subTest(raw=raw):
+                self.assertEqual(cp.policy._normalize_repo(raw), (want, None))
+
+    def test_the_bounds_of_each_segment_are_githubs(self):
+        self.assertEqual(cp.policy._normalize_repo(f"github.com/{'a' * 39}/w")[1], None)
+        self.assertEqual(cp.policy._normalize_repo(f"github.com/a/{'w' * 100}")[1], None)
+        for raw in (f"github.com/{'a' * 40}/w", f"github.com/a/{'w' * 101}"):
+            with self.subTest(raw=raw[:30]):
+                self.assertIsNone(cp.policy._normalize_repo(raw)[0])
+
+    def test_every_other_shape_is_refused_with_a_reason(self):
+        for raw in ("", "gitlab.com/acme/widgets", "github.com.evil/acme/widgets",
+                    "github.com/acme", "github.com/acme/widgets/extra",
+                    "github.com//widgets", "github.com/acme/", "github.com/acme/.git",
+                    "github.com/acme/..", "github.com/acme/.", "github.com/../widgets",
+                    "github.com/ac_me/widgets", "github.com/ac.me/widgets",
+                    "github.com/acme/wid gets", "github.com/acme/wid%2fgets",
+                    "github.com/acme/*", "https://github.com/acme/widgets",
+                    "github.com/acme/widgets\u2028", "github.com/acme/widgets "):
+            with self.subTest(raw=raw):
+                repo, why = cp.policy._normalize_repo(raw)
+                self.assertIsNone(repo)
+                self.assertTrue(why)
+
+    def test_a_non_ascii_letter_is_refused_before_case_folds_it(self):
+        # U+212A KELVIN SIGN lower-cases to ASCII `k`, so a fold before the character
+        # check would pass `acKme` as `ackme`; U+0130 folds to `i` plus a combining dot.
+        for raw in ("github.com/ac\u212ame/widgets", "github.com/acme/wid\u212aets",
+                    "github.com/\u0130cme/widgets", "github.com/acme/w\u00e9"):
+            with self.subTest(raw=raw):
+                repo, why = cp.policy._normalize_repo(raw)
+                self.assertIsNone(repo)
+                self.assertIn("outside ASCII", why)
+        self.assertIsNone(
+            cp.policy._normalize_repo_pattern("github.com/ac\u212ame/*")[0])
+
+    def test_a_lone_surrogate_or_a_non_string_is_refused(self):
+        repo, why = cp.policy._normalize_repo("github.com/acme/w\ud800")
+        self.assertIsNone(repo)
+        self.assertIn("surrogate", why)
+        # The reason quotes the input escaped, so it can be served and stored.
+        self.assertEqual(cp.store._escaped(why), why)
+        for raw in (None, 7, ["github.com/acme/widgets"]):
+            with self.subTest(raw=raw):
+                self.assertIsNone(cp.policy._normalize_repo(raw)[0])
+
+    def test_a_quoted_input_is_bounded(self):
+        _, why = cp.policy._normalize_repo("gitlab.com/" + "x" * 5000)
+        self.assertLess(len(why), 600)
+
+
+class RepoPatternTests(unittest.TestCase):
+    """``policy._normalize_repo_pattern`` and ``_repo_covers``: an exact repo or every
+    repo of one owner, and nothing between or beyond."""
+
+    def test_an_owner_wildcard_is_normalised(self):
+        for raw in ("github.com/acme/*", "  GitHub.com/ACME/*  "):
+            with self.subTest(raw=raw):
+                self.assertEqual(cp.policy._normalize_repo_pattern(raw),
+                                 ("github.com/acme/*", None))
+        self.assertEqual(cp.policy._normalize_repo_pattern(" github.com/acme/w.git "),
+                         ("github.com/acme/w", None))
+
+    def test_no_other_wildcard_is_a_pattern(self):
+        for raw in ("github.com/*/*", "github.com/*/widgets", "github.com/acme/w*",
+                    "github.com/acme/**", "*/acme/*", "github.com/*", "gitlab.com/a/*",
+                    "github.com/ac_me/*", None):
+            with self.subTest(raw=raw):
+                pattern, why = cp.policy._normalize_repo_pattern(raw)
+                self.assertIsNone(pattern)
+                self.assertTrue(why)
+
+    def test_an_owner_wildcard_covers_that_owners_repos_only(self):
+        covers = cp.policy._repo_covers
+        self.assertTrue(covers("github.com/acme/widgets", "github.com/acme/*"))
+        self.assertTrue(covers("github.com/acme/gadgets", "github.com/acme/*"))
+        # A longer owner that starts with this one is another owner.
+        self.assertFalse(covers("github.com/acme-corp/widgets", "github.com/acme/*"))
+        self.assertFalse(covers("github.com/acmes/widgets", "github.com/acme/*"))
+        self.assertFalse(covers("github.com/other/widgets", "github.com/acme/*"))
+
+    def test_an_exact_pattern_covers_its_repo_only(self):
+        covers = cp.policy._repo_covers
+        self.assertTrue(covers("github.com/acme/widgets", "github.com/acme/widgets"))
+        self.assertFalse(covers("github.com/acme/widgets2", "github.com/acme/widgets"))
+        self.assertFalse(covers("github.com/acme/widget", "github.com/acme/widgets"))
+        # Only a whole `/*` segment is a wildcard; a star anywhere else is a literal.
+        self.assertFalse(covers("github.com/acmecorp/widgets", "github.com/acme*"))
+
+    def test_a_card_offers_the_repo_then_its_owner(self):
+        self.assertEqual(cp.policy._repo_candidates("github.com/acme/widgets"),
+                         ["github.com/acme/widgets", "github.com/acme/*"])
+        self.assertEqual(cp.policy._repo_scope("github.com/acme/*"),
+                         "every repo of the owner")
+        self.assertEqual(cp.policy._repo_scope("github.com/acme/widgets"), "exact repo")
+
+    def test_a_rule_takes_allow_or_block_only(self):
+        self.assertIsNone(cp.policy._repo_rule_error("allow"))
+        self.assertIsNone(cp.policy._repo_rule_error("block"))
+        for action in ("deny", "ask", "", "Allow"):
+            with self.subTest(action=action):
+                self.assertTrue(cp.policy._repo_rule_error(action))
+
+
+class RepoDecideTests(unittest.TestCase):
+    """``policy._repo_ruling``: block, then allow, then a live lease, within the
+    asking class; nothing matching is a hold whose reason names other classes."""
+
+    REPO = "github.com/acme/widgets"
+
+    def setUp(self):
+        cp.store._init_db()
+        _set_repo_rules([])
+        _set_repo_leases([])
+        self.addCleanup(_set_repo_rules, [])
+        self.addCleanup(_set_repo_leases, [])
+
+    def _ruling(self, repo=REPO, client_class=CLASS):
+        return cp.policy._repo_ruling(repo, client_class)
+
+    def test_nothing_matching_is_a_hold(self):
+        decision, reason, card = self._ruling()
+        self.assertEqual((decision, card), ("hold", None))
+        self.assertNotIn("matched only for", reason)
+
+    def test_an_allow_allows_and_a_block_denies(self):
+        _set_repo_rules([(self.REPO, "allow")])
+        self.assertEqual(self._ruling()[0], "allow")
+        _set_repo_rules([(self.REPO, "block")])
+        self.assertEqual(self._ruling()[0], "deny")
+
+    def test_a_block_beats_an_allow_either_way_round(self):
+        for rules in ([(self.REPO, "allow"), ("github.com/acme/*", "block")],
+                      [("github.com/acme/*", "allow"), (self.REPO, "block")]):
+            with self.subTest(rules=rules):
+                _set_repo_rules(rules)
+                self.assertEqual(self._ruling()[0], "deny")
+
+    def test_a_block_beats_a_live_lease(self):
+        _set_repo_rules([("github.com/acme/*", "block")])
+        _set_repo_leases([(self.REPO, 600)])
+        decision, reason, card = self._ruling()
+        self.assertEqual((decision, card), ("deny", None))
+        self.assertIn("blocked by rule", reason)
+
+    def test_a_standing_allow_is_named_over_a_lease(self):
+        _set_repo_rules([(self.REPO, "allow")])
+        _set_repo_leases([(self.REPO, 600)])
+        decision, reason, card = self._ruling()
+        self.assertEqual((decision, card), ("allow", None))
+        self.assertIn("allowed by rule", reason)
+
+    def test_a_live_lease_allows_and_names_its_card(self):
+        _set_repo_leases([(self.REPO, 600)])
+        decision, reason, card = self._ruling()
+        self.assertEqual((decision, card), ("allow", "card-0"))
+        self.assertIn("allowed by lease", reason)
+
+    def test_a_lapsed_lease_allows_nothing(self):
+        _set_repo_leases([(self.REPO, -1)])
+        self.assertEqual(self._ruling()[0], "hold")
+
+    def test_a_lease_is_for_its_repo_and_its_class_only(self):
+        _set_repo_leases([("github.com/acme/gadgets", 600), (self.REPO, 600, "mcp")])
+        self.assertEqual(self._ruling()[0], "hold")
+
+    def test_another_classs_rule_is_only_named(self):
+        _set_repo_rules([("github.com/acme/*", "allow", "mcp"),
+                         (self.REPO, "block", "other")])
+        decision, reason, _ = self._ruling()
+        self.assertEqual(decision, "hold")
+        self.assertIn("matched only for: mcp, other", reason)
+
+    def test_an_owner_wildcard_covers_one_owner(self):
+        _set_repo_rules([("github.com/acme/*", "allow")])
+        self.assertEqual(self._ruling()[0], "allow")
+        self.assertEqual(self._ruling("github.com/acme-corp/widgets")[0], "hold")
 
 
 if __name__ == "__main__":

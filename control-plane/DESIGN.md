@@ -1,11 +1,12 @@
 # Control plane — policy, holds, approvals and the audit views
 
 The control plane's decisions as an operator meets them: how a card grants, how holds
-behave under load, the audit views, the verbs over standing policy, and why the tool
-surface gets tables of its own but shares the queue. Each sits beside the code that
-decides it, in this directory, including where the approval page (`control-plane-ui/`)
-presents it. What the control plane shares with the rest of the system stays in the
-root, and this file does not repeat it:
+behave under load, the audit views, the verbs over standing policy, why the tool
+surface gets tables of its own but shares the queue, and how the repo surface reuses
+the holds with no allow-once. Each sits beside the code that decides it, in this
+directory, including where the approval page (`control-plane-ui/`) presents it. What
+the control plane shares with the rest of the system stays in the root, and this file
+does not repeat it:
 
 - the control nets and the enforcers' bridges, `DESIGN.md` → "Control plane — policy,
   audit, hold-for-approval";
@@ -141,10 +142,10 @@ a button that spelled it into the page would keep saying it on a store set to so
 else. `/api/config` serves it so the button labels itself.
 
 **A lease does not release a card already raised for a sibling request.** A lease is
-keyed `(host, client_class)`; a hold's group key is `(client, host, port, proto)`
-(`holds._group_key`). Those do not line up, so granting a lease from one card leaves
-another card for the *same host on a different port*, or from a different client in the
-same class, still pending — its waiter blocking until `CONTROL_HOLD_TIMEOUT` elapses
+keyed `(host, client_class)`; a hold's group key is its surface, then `(client, host,
+port, proto)` (`holds._group_key`). Those do not line up, so granting a lease from one
+card leaves another card for the *same host on a different port*, or from a different
+client in the same class, still pending — its waiter blocking until `CONTROL_HOLD_TIMEOUT` elapses
 and it default-denies, even though leased policy now allows it. The agent's retry then
 sails through on the live lease.
 
@@ -830,7 +831,58 @@ pool" case cannot arise. The decision stands on the stream.
 Merging the queue merges little else. The tables are separate, `resolve` keeps
 per-surface action sets (dispatched on the card's kind, since the approval id already
 determines its table), each surface renders its own card, and the merged payload is a
-union of two per-surface builders rather than one query over a discriminator column.
+union of per-surface builders, one per surface, rather than one query over a
+discriminator column.
+
+## The repo surface
+
+The governed git service asks the control plane per repo before it serves a fetch. Its
+policy is a third surface beside egress and tools.
+
+**Its own tables, as tool policy has them, and no seed.** `repo_rules`, `repo_leases`
+and `repo_approvals` are shaped as `rules`, `leases` and `approvals`, over a repo
+(`github.com/owner/repo`, or `github.com/owner/*` for a rule) where those name a host.
+Repo and egress policy never read each other's tables: `github.com` allowed for a class
+says nothing about which repos it may fetch through the service, and the reverse.
+Nothing seeds them; they fill from the operator's edits and the cards' answers. The
+decision is `_decide`'s order over them (`policy._repo_ruling`): block, then allow, then
+a live lease, within the asking class, so no lease outlives a block.
+
+**The hold machinery is reused; `/authorize`'s route is not.** A held fetch blocks as a
+held request does, so `holds._authorize_repo` draws on the same registry, caps,
+deadline and saturation account, and its cards join the one queue. It is a function,
+not a route here, because no two enforcers share a bridge: the git service gets one of
+its own. Two things keep the surfaces apart inside the shared registry. The group key
+carries the surface (`holds._group_key`), so an egress request for a host spelled
+`github.com/acme/widgets` never joins a repo card. And the caps are shared, so a fetch
+flood can make egress fail closed, which is the caps doing their job: the banner shows
+it, its last host the repo path.
+
+**A repo card has no allow-once.** One fetch is an advertisement GET and then one or
+more upload-pack POSTs, so a grant for one request cannot let a fetch through, and a
+grant for "one fetch" would need a window the operator chose not to add. The narrowest
+allow is a repo lease at `CONTROL_LEASE_SECONDS`, and the card's actions are
+`api_approvals.REPO_ACTIONS`: `allow_lease`, `allow_persist`, `deny_once` and
+`deny_persist`. The cost, stated by the operator: the narrowest allow covers every fetch
+of the repo by the class while the lease lasts. Two consequences follow, each in
+`holds._authorize_repo`:
+
+- Only the advertisement is held. An upload with nothing allowing it is denied at once
+  with no card: a lease that lapsed between a fetch's requests, or a POST sent without
+  asking. The next fetch is held anew.
+- An unclassified client is denied at once with no card. A lease and a rule both need
+  a class, so with no allow-once its card could only deny; the reason names
+  `CONTROL_CLIENT_CLASSES`.
+
+**A repo row is never host-less.** Its `host` is `policy.REPO_HOST` and `audit.repo`
+names the repo, so the glance folds it by what it displays, as an egress row, and never
+by approval id as a host-less tool row (`audit.grouped`). Its stage is the surface's own
+literal (`git-advertise`, `git-upload`, `git`, `git-policy`), never the caller's word.
+
+**Repo rules are created and revoked, never edited.** Without an edit a rule's id always
+names the rule it was created as, so a revoke needs no "as the page showed it"
+expectation (`api_repos.revoke_repo_rule`), and a change is a revoke and a create until
+something needs it as one operation.
 
 **The policy export is one builder, for the page and any later export.**
 `GET /api/mcp/export` serves `api_mcp._policy_export` through `_export_bytes`, and the
@@ -889,9 +941,10 @@ config surface either.
 `/api/egress/rules/{id}/revoke` takes a rule back; `/api/mcp/rules` and
 `/api/mcp/servers` are the gateway surface's, and they precede the gateway rather
 than arriving with it — tool policy is configuration first, so the surface that
-states it is usable before anything consumes it. A bare `/api/rules` would be a
-generic name on a specific thing. The lifecycle endpoints keep
-unprefixed names (`/approvals`, `/approvals/stream`, `/approvals/{id}/resolve`), so
+states it is usable before anything consumes it. `/api/git/rules` and
+`/api/git/leases` are the repo surface's, and precede the git service the same way. A
+bare `/api/rules` would be a generic name on a specific thing. The lifecycle endpoints
+keep unprefixed names (`/approvals`, `/approvals/stream`, `/approvals/{id}/resolve`), so
 the URL shape states the split itself: prefixed is per-surface policy, unprefixed is
 the one queue every surface feeds (see "`approvals` splits the same way" above). The
 shape rejected is `/api/rules?surface=…`, a discriminator over a single path

@@ -1715,7 +1715,7 @@ its agent is told the ask is final; that only closes a question, as a withdrawal
 
 How the control plane keeps what the gateway brings it — tool policy in a table of its
 own rather than a scope on `rules`, tool asks in their own approvals table, and one
-pending queue for both surfaces — is the control plane's own code, and is designed in
+pending queue every surface feeds — is the control plane's own code, and is designed in
 `control-plane/DESIGN.md` → "The tool surface: its own tables, the one queue".
 
 **The control plane learns a server's tools from the gateway, never by
@@ -2607,6 +2607,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | 3 | skills + quality-gate hooks in the image | planned |
 | 4 | pull-through package cache | planned |
 | — | governed git path — clone/fetch (writes are the gateway's) | planned |
+| — | the git path's control-plane surface — `repo_rules`, `repo_leases`, repo cards with no allow-once, the repo hold, `/api/git/rules` and `/api/git/leases` | **done** — no route calls the hold yet, and the page does not draw a repo card |
 | — | GitHub write set — `GITHUB_READ_ONLY` off behind the gateway, with per-tool repo scoping | planned |
 | — | pinned allows — `tool_pins`, read under an `ask` rule only; listed and revocable in the MCP tab | **done** |
 | — | pinning from a tool card — `allow_pinned` and the field picker | **done** |

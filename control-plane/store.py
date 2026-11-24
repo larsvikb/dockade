@@ -3,10 +3,11 @@
 
 This is the crown-jewel state: the policy rules that decide egress, the timed
 leases that decide it for a while, the per-tool rules that decide the MCP
-gateway's surface and the pins that answer its asks in advance, the audit trail
-those decisions are written to, the durable approvals rows that are the single
-source of truth for a hold's outcome, the call tokens that carry a pin's card to
-its calls' outcomes, and the ingest cursor. Everything else in this service reads
+gateway's surface and the pins that answer its asks in advance, the per-repo rules,
+leases and cards of the git surface, the audit trail those decisions are written to,
+the durable approvals rows that are the single source of truth for a hold's outcome,
+the call tokens that carry a pin's card to its calls' outcomes, and the ingest
+cursor. Everything else in this service reads
 and writes through here.
 
 Bottom of the dependency order: this module imports no other module of the
@@ -47,7 +48,7 @@ LEGACY_CLIENT_CLASS = "sandbox"
 # The schema this code expects. Every entry in ``_STEPS`` below adds exactly one,
 # and a store records the version it is at (see ``_migrate``), so "what has already
 # run here" is a number to compare rather than a schema to interrogate.
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # The integers sqlite3 can bind: SQLite's INTEGER is 64-bit signed, and binding a
 # value outside it raises OverflowError, which a route would answer as a 500. A fact
@@ -535,8 +536,8 @@ def _step_12_schema_digest(conn: sqlite3.Connection) -> None:
 # The tool surface's approvals, which split from `approvals` for the reason the rules
 # did: the rows are egress-shaped there — host, port, proto, method, url — against a
 # server, a tool and a payload here (control-plane/DESIGN.md, "``approvals`` splits
-# the same way"). What does NOT split is the operator's pending queue; these rows and
-# those are two builders behind one list.
+# the same way"). What does NOT split is the operator's pending queue; these rows,
+# those and the repo cards (`_REPO_APPROVALS_DDL`) are builders behind one list.
 #
 # ONE definition, shared by the v16 rebuild and the fresh-store DDL, as `_LEASES_DDL`
 # is and with its rule for a column added later.
@@ -900,6 +901,76 @@ def _step_17_card_outcome(conn: sqlite3.Connection) -> None:
               "NULL)", flush=True)
 
 
+# THE REPO SURFACE: the governed git service's policy, its own three tables, as tool
+# policy has its own (control-plane/DESIGN.md, "The repo surface"). Repo and egress
+# policy never read each other's tables, and nothing seeds these: rules come from the
+# operator's edits and the cards' answers.
+#
+# Each is ONE definition, shared by the v18 step and the fresh-store DDL, as
+# `_LEASES_DDL` is and with its rule for a column added later.
+_REPO_RULES_DDL = """
+    CREATE TABLE IF NOT EXISTS repo_rules (
+        -- Never reused: a revoke from an open page names a rule by it.
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- `github.com/owner/repo` or `github.com/owner/*`, in
+        -- `policy._normalize_repo_pattern` form (see `policy._repo_covers`).
+        pattern      TEXT NOT NULL,
+        action       TEXT NOT NULL,          -- 'allow' | 'block'
+        source       TEXT NOT NULL,          -- 'operator'
+        created_at   REAL NOT NULL,
+        -- WHICH client population this rule decides for, as on `rules`. No
+        -- default: no repo rule predates classes.
+        client_class TEXT NOT NULL,
+        UNIQUE(pattern, client_class)
+    )"""
+
+_REPO_LEASES_DDL = """
+    CREATE TABLE IF NOT EXISTS repo_leases (
+        -- Never reused, as on `leases`.
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- ONE exact repo, in `policy._normalize_repo` form, matched by equality:
+        -- a lease answers how wide by expiring, as on `leases`.
+        repo         TEXT NOT NULL,
+        client_class TEXT NOT NULL,
+        approval_id  TEXT NOT NULL,          -- the repo card it was granted from
+        created_at   REAL NOT NULL,
+        expires_at   REAL NOT NULL CHECK (typeof(expires_at) = 'real'),
+        granted_by   TEXT NOT NULL           -- provenance of the resolver
+    )"""
+
+_REPO_APPROVALS_DDL = """
+    CREATE TABLE IF NOT EXISTS repo_approvals (
+        id           TEXT PRIMARY KEY,
+        ts           REAL NOT NULL,
+        repo         TEXT NOT NULL,          -- `policy._normalize_repo` form
+        client       TEXT,
+        -- Settled when the hold is raised, as on `approvals`, and never
+        -- unclassified: such a fetch is denied with no card.
+        client_class TEXT,
+        status       TEXT NOT NULL,          -- pending | allowed | denied | expired
+        mode         TEXT,                   -- once | lease | persist | present
+        resolved_at  REAL,
+        resolved_by  TEXT,                   -- provenance of the resolver
+        pattern      TEXT                    -- what a persist wrote, as on `approvals`
+    )"""
+
+_REPO_APPROVALS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS repo_approvals_status ON repo_approvals(status)")
+
+
+def _step_18_repo_surface(conn: sqlite3.Connection) -> None:
+    """v18 — the repo surface: ``repo_rules``, ``repo_leases`` and ``repo_approvals``,
+    created empty, and ``audit.repo``, which existing rows keep NULL: nothing before
+    this step fetched a repo through the control plane."""
+    for ddl in (_REPO_RULES_DDL, _REPO_LEASES_DDL, _REPO_APPROVALS_DDL,
+                _REPO_APPROVALS_INDEX):
+        conn.execute(ddl)
+    if "repo" not in _columns(conn, "audit"):
+        conn.execute("ALTER TABLE audit ADD COLUMN repo TEXT")
+        print("control-plane: added repo to audit (existing rows keep NULL — they "
+              "predate the repo surface)", flush=True)
+
+
 # Ordered, and the order is the only thing that decides what runs: a step is applied
 # when its version exceeds the store's, so steps must be APPEND-ONLY and never
 # renumbered, reordered or edited once shipped — a store in the field has already run
@@ -923,6 +994,7 @@ _STEPS: tuple[tuple[int, str, Callable[[sqlite3.Connection], None]], ...] = (
     (15, "sandbox id on tool asks", _step_15_ask_sandbox),
     (16, "timed pins scoped to a sandbox", _step_16_scoped_pins),
     (17, "a tool card's outcome: settled_by and refused_at", _step_17_card_outcome),
+    (18, "the repo surface", _step_18_repo_surface),
 )
 
 
@@ -1097,7 +1169,12 @@ def _init_db() -> None:
                 -- card's own call; NULL on every other row, a call a pin answered
                 -- under the same id included (ingest._settle_tool_row). Read by
                 -- the operator's card (holds._list_granted).
-                settled_by    TEXT
+                settled_by    TEXT,
+                -- The repo a git-surface row concerns, in `policy._normalize_repo`
+                -- form, or the pattern a repo rule write names. NULL on every other
+                -- row. Such a row's `host` is `policy.REPO_HOST`, never NULL, so the
+                -- glance never folds it as a host-less tool row (`audit.grouped`).
+                repo          TEXT
             )""")
         conn.execute("CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts)")
         conn.execute(_AUDIT_SETTLED_INDEX)
@@ -1147,6 +1224,10 @@ def _init_db() -> None:
         conn.execute(_TOOL_APPROVALS_DDL)
         for index in _TOOL_APPROVALS_INDEXES:
             conn.execute(index)
+        # The repo surface (``_REPO_RULES_DDL`` and the two beside it).
+        for ddl in (_REPO_RULES_DDL, _REPO_LEASES_DDL, _REPO_APPROVALS_DDL,
+                    _REPO_APPROVALS_INDEX):
+            conn.execute(ddl)
         # Call tokens (``_TOOL_CALL_TOKENS_DDL``). New as a table, so it needs no
         # `_STEPS` entry: a store from before it gains it here, and its version stays.
         conn.execute(_TOOL_CALL_TOKENS_DDL)
@@ -1256,13 +1337,14 @@ def _audit(kind: str, **fields) -> None:
         conn.execute(
             "INSERT INTO audit(ts, kind, stage, host, port, proto, client, "
             "client_class, actor, method, url, reason, server, tool, approval_id, "
-            "status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "status, repo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), kind, cap(fields.get("stage")), cap(fields.get("host")),
              fields.get("port"), cap(fields.get("proto")), cap(fields.get("client")),
              cap(fields.get("client_class")), cap(fields.get("actor")),
              cap(fields.get("method")), cap(fields.get("url")), cap(fields.get("reason")),
              cap(fields.get("server")), cap(fields.get("tool")),
-             cap(fields.get("approval_id")), cap(fields.get("status"))))
+             cap(fields.get("approval_id")), cap(fields.get("status")),
+             cap(fields.get("repo"))))
         conn.commit()
     # Mirror every row to stdout, so `make logs-cp` is a live feed; the table stays
     # the record. One greppable line: empty fields omitted, reason after ' :: ', and
@@ -1270,7 +1352,7 @@ def _audit(kind: str, **fields) -> None:
     shown = " ".join(
         f"{k}={_printable(fields[k])}" for k in
         ("stage", "host", "port", "proto", "client", "client_class", "actor",
-         "method", "url", "server", "tool", "approval_id")
+         "method", "url", "server", "tool", "repo", "approval_id")
         if fields.get(k) is not None)
     reason = fields.get("reason")
     print(f"AUDIT {kind} {shown}" + (f" :: {_printable(reason)}" if reason else ""),

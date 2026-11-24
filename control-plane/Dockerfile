@@ -39,6 +39,7 @@ COPY control-plane/api_authorize.py ./api_authorize.py
 COPY control-plane/api_tool.py ./api_tool.py
 COPY control-plane/api_approvals.py ./api_approvals.py
 COPY control-plane/api_egress.py ./api_egress.py
+COPY control-plane/api_repos.py ./api_repos.py
 COPY control-plane/api_mcp.py ./api_mcp.py
 COPY control-plane/api_views.py ./api_views.py
 # Not served, each only run: store_backup.py by `make backup` and `make restore` in a

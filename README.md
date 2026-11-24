@@ -365,6 +365,7 @@ dockade/
     api_tool.py             #   /tool/* — the gateway's bridge (tool-authorize-net)
     api_approvals.py        #   the queue and resolve — the endpoint that grants
     api_egress.py           #   standing egress rules, and leases
+    api_repos.py            #   standing repo rules for the git surface, and leases
     api_mcp.py              #   MCP servers and tool rules
     api_views.py            #   the audit record, the UI's settings, /status — grants nothing
     provenance.py           #   who performed a privileged act, for the record
@@ -376,8 +377,10 @@ dockade/
     audit.py                #   the read side: the folded glance, the paged record,
                             #   and the filters both share
     policy.py               #   what a rule pattern matches; peer address -> client
-                            #   class; (host, class) -> allow/deny/hold
-    holds.py                #   the in-process registry a held request blocks on
+                            #   class; (host, class) -> allow/deny/hold, and the
+                            #   same for a repo
+    holds.py                #   the in-process registry a held request blocks on,
+                            #   and the repo hold a git fetch will wait in
     inventory.py            #   what each server exposes, as the gateway last reported it
     ingest.py               #   drains the proxy's and the gateway's audit streams into
                             #   the store — rows and cursor advance in one transaction

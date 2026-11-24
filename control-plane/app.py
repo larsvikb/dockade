@@ -14,6 +14,7 @@ and nowhere else:
   - ``api_tool``      — ``/tool/*``, the MCP gateway's bridge.
   - ``api_approvals`` — the queue and ``resolve``: the endpoint that grants.
   - ``api_egress``    — standing egress rules, and the leases a card granted.
+  - ``api_repos``     — standing repo rules for the git surface, and its leases.
   - ``api_mcp``       — MCP servers, tool rules, and the pins that answer asks.
   - ``api_views``     — the audit record, the UI's settings, /status. Grants nothing.
   - ``provenance``    — ``_actor``: who resolved an approval or changed policy.
@@ -25,9 +26,11 @@ reader can see which one is being asked:
   - ``store``   — SQLite: the schema, the audit write, the seed. The crown jewel.
   - ``audit``   — the READ side of that store: the two decision views, their shared
     filters and the record view's paging.
-  - ``policy``  — what a rule pattern matches, and what a host decides to.
+  - ``policy``  — what a rule pattern matches, and what a host, a tool call or a
+    repo decides to.
   - ``holds``   — the in-process registry a blocked request waits on, its caps
-    and its duplicate grouping.
+    and its duplicate grouping; the repo hold the git service's bridge will call;
+    and the tool asks, which block nothing.
   - ``ingest``  — draining the egress proxy's and the MCP gateway's own audit files
     into the store, and watching both for a writer that stopped.
   - ``inventory`` — what each MCP server last said it exposes, held in memory.
@@ -92,6 +95,7 @@ import api_approvals
 import api_authorize
 import api_egress
 import api_mcp
+import api_repos
 import api_tool
 import api_views
 import holds
@@ -253,6 +257,7 @@ authorize_app.include_router(api_authorize.router)
 tool_app.include_router(api_tool.router)
 app.include_router(api_approvals.router)
 app.include_router(api_egress.router)
+app.include_router(api_repos.router)
 app.include_router(api_mcp.router)
 app.include_router(api_views.router)
 

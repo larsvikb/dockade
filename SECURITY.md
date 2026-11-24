@@ -169,6 +169,24 @@ report.
   enabled as a standing, revisitable decision, as is another tier's hosted search with
   the same property: queries only, no URL the agent chose. See "Server-side
   execution: accepted governance blind spots" in `DESIGN.md`.
+- **agy's server-side tools.** In the Antigravity tier, `read_url_content`, remote
+  agents and remote control are accepted for now with their reach stated, though the
+  first may fetch a URL the agent chose on Google's side, and refusing remote
+  control's own host may not switch it off. See "Antigravity
+  (`run-antigravity-sandbox.sh`)" in `DESIGN.md`.
+- **Every cloud tier reaching Anthropic's lifeline unheld.** The lifeline is scoped
+  to the agent class every cloud tier shares, so an agy or Codex sandbox reaches
+  Anthropic's API with no hold, as Claude's does. See "Policy is scoped to a client
+  class" in `DESIGN.md`.
+- **A standing grant answering every cloud tier.** An allow rule, a lease, a tool
+  rule or a pin for good made while working with one tier answers another tier's
+  request too, and its result goes to that tier's provider. A single approval stays
+  with the sandbox it answered, and a timed pin with the sandbox whose card it was
+  made from. See "Policy is scoped to a client class" in `DESIGN.md`.
+- **What the agent reads going to the tier's provider.** The workspace, `/refs` and
+  every gateway result enter the conversation, which goes to the vendor the operator
+  logged the tier in with, under that account's terms. See "Server-side execution:
+  accepted governance blind spots" in `DESIGN.md`.
 - **Any agent CLI's settings file being bypassable**, including Claude Code's
   `permissions.deny` and a local `managed-settings.json`. No client settings file is
   a containment boundary here, and under organisation authentication Claude Code does

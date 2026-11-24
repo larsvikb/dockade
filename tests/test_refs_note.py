@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = {tier: (ROOT / tier / "tier-setup.sh").read_text()
-         for tier in ("claude-sandbox", "opencode-sandbox")}
+         for tier in ("claude-sandbox", "opencode-sandbox", "antigravity-sandbox")}
 CLAUDE_HOOK = HOOKS["claude-sandbox"]
 REEXEC = 'exec gosu "$USERNAME" "$0" "$@"'
 
@@ -107,7 +107,8 @@ def _is_doc(name: str) -> bool:
 
 class RefsReadAllowTests(unittest.TestCase):
     """Each tier tested below may read /refs without asking, and nothing else about
-    the refs loads. The read allow is measured to load nothing from a ref; the
+    the refs loads. Claude's read allow is measured to load nothing from a ref, and
+    agy's is not yet (DESIGN.md, "Reference mounts"); the
     command-line flag loads a directory's skills, agents and commands (NOTES.md, "An
     allowed read directory loads nothing from it"); the environment variable exists to
     load the allowed directories' CLAUDE.md files. So each tier's allow is held to
@@ -134,6 +135,9 @@ class RefsReadAllowTests(unittest.TestCase):
                          {"external_directory": {"/refs/**": "allow"}})
         # Once: an agent's own `permission` block could grant a second, wider one.
         self.assertEqual(text.count("external_directory"), 1)
+        text = (ROOT / "antigravity-sandbox" / "settings.json").read_text()
+        self.assertEqual(json.loads(text)["permissions"], {"allow": ["read_file(/refs)"]})
+        self.assertEqual(text.count("read_file("), 1)
 
     @unittest.skipUnless(_GIT or _STRICT, "git is not installed")
     def test_no_other_way_to_load_a_ref_is_in_the_tree(self):
@@ -155,7 +159,9 @@ class RefsReadAllowTests(unittest.TestCase):
                         ".claude/skills/review-before-push/SKILL.md",
                         ".claude/agents/commit-reviewer.md", ".claude/agents/planner.md",
                         ".claude/agents/plan-reviewer.md", ".claude/agents/implementer.md",
-                        "claude-sandbox/instructions.md", "opencode-sandbox/instructions.md"}
+                        "claude-sandbox/instructions.md", "opencode-sandbox/instructions.md",
+                        "antigravity-sandbox/user-AGENTS.md",
+                        "antigravity-sandbox/instructions.md"}
         # The fragments the tiers' sources include: globbed, and held non-empty.
         fragments = {p.relative_to(ROOT).as_posix()
                      for p in (ROOT / "sandbox-common" / "instructions").glob("*/*.md")}
@@ -165,6 +171,7 @@ class RefsReadAllowTests(unittest.TestCase):
                          "instruction files the guard no longer scans")
         allowed = {"additionalDirectories": {"claude-sandbox/user-settings.json"},
                    "external_directory": {"opencode-sandbox/opencode.json"},
+                   "read_file(": {"antigravity-sandbox/settings.json"},
                    "--add-dir": set(),
                    "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": set()}
         found: dict[str, set[str]] = {needle: set() for needle in allowed}

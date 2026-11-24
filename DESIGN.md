@@ -26,7 +26,7 @@ audited.**
   plane only to ask about a tool call, so there is no relay in it to turn.
 
 Two agent **tiers**: **tier 1** is a cloud agent with governed egress through the proxy,
-one launcher per vendor's CLI (Claude's is built); **tier 2** is a local-LLM agent
+one launcher per vendor's CLI (Claude's and Antigravity's are built); **tier 2** is a local-LLM agent
 (opencode) with *no egress and no credentials at all*. Three egress **modes** in the
 firewall: **governed** (via the proxy), **local** (tier 2, only the inference service),
 **standalone** (Claude's proxy-less fallback with a direct allowlist).
@@ -110,7 +110,7 @@ anything behind it.
      SANDBOXES ─────► UNGOVERNED tools (sandbox-net only, NO egress;
                       e.g. the local-LLM inference service)
 
-     tier 1: a cloud agent (Claude, yolo) — governed egress through the proxy
+     tier 1: a cloud agent (Claude or agy, yolo) — governed egress through the proxy
      tier 2: opencode + local LLM — NO egress, NO credentials
 
      No sandbox tier has a route to control-net / the control plane.
@@ -543,8 +543,10 @@ of the boundary — provided what is mounted is only files.
   `claude-sandbox/user-settings.json` makes `/refs` a working directory, with the
   permissions the workspace has, edits included, so `:ro` is what keeps it read-only.
   opencode's `permission.external_directory` in `opencode-sandbox/opencode.json`
-  allows that one permission under `/refs/**`. Each covers the whole of `/refs`,
-  statically, so it is the same for every sibling and needs no launch file.
+  allows that one permission under `/refs/**`, and agy's `read_file(/refs)` in
+  `antigravity-sandbox/settings.json` allows reads under `/refs`. Each covers the
+  whole of `/refs`, statically, so it is the same for every sibling and needs no
+  launch file.
   Claude's allow is at user scope rather than on the command line, because the flag form
   loads skills, agents and commands from the named directory's `.claude/`, and the
   settings form loads nothing from a ref — measured, with each run's hooks, in
@@ -555,9 +557,12 @@ of the boundary — provided what is mounted is only files.
   may not start with a dot (`sc_refs`). `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`
   is what would turn the refs' `CLAUDE.md` files into instructions, and
   `tests/test_refs_note.py` keeps it, the flag and any second allow out of the
-  tree. Its content is still untrusted input — a ref can steer the agent the way
-  any file it reads can — and is bounded by the same egress and tool governance as
-  everything else.
+  tree. In agy's tier it is unmeasured: agy loads a directory's `AGENTS.md`,
+  `GEMINI.md` and skills when the command line adds it, and whether one it may only
+  read through a settings rule loads them too is open (`NOTES.md`). If it does,
+  agy's allow goes. Its content is still untrusted input — a ref can steer the agent
+  the way any file it reads can — and is bounded by the same egress and tool
+  governance as everything else.
 
 ### Git identity — from the host at launch, not the tree
 
@@ -788,6 +793,27 @@ skill (third-party search API through the egress proxy) so search becomes govern
 and audited. The same pattern applies to any *future* server-side tool whose blind
 spot is less acceptable than WebSearch's.
 
+### Antigravity (`run-antigravity-sandbox.sh`)
+
+Measured in a tier-1 sandbox on agy 1.5.13 and 1.5.16 (`NOTES.md` → "agy behind
+dockade's proxy, measured before its tier"); re-test when agy adds or changes tools.
+Vendor console: Gemini Enterprise, for business accounts only, so a personal account
+has no switch for any row below.
+
+| Tool | Executes | Governed? | If allowed, governance lost over… |
+|------|----------|-----------|-----------------------------------|
+| `search_web` | server-side (Google's search grounding) | **No** | what WebSearch's row says. Accepted as WebSearch is: given a URL with a fresh marker, it returned no live field of the page; a second probe was inconclusive |
+| `read_url_content` | unmeasured: the model was never offered it | **No**, if server-side | if it fetches on Google's side, a GET to a URL the agent chooses: an ungoverned egress path, not only intake. **Accepted** by the operator's decision, not on WebSearch's terms |
+| Remote agents (`--remote-agent`) | server-side (Google-hosted agents) | **No** | whatever the account has connected at Google, such as GitHub repos and Drive files. **Accepted**; connect nothing there. The measured Starter account did not offer them |
+| Remote control (`--remote-control`, `agy remote-control`) | client-side, over a host of its own, `jetski-webchannel.googleapis.com` | at the transport, if refusing that host switches it off | a remote UI that prompts and approves in the sandbox. **Accepted**; the host stays unapproved. Whether refusing it switches remote control off is unmeasured, and if it does not, that hole is accepted for the tier's first version |
+| Browser tools (`open_browser_url`, `read_browser_page`, `browser_*`) | not offered to the model | — | none while not offered; the image has no browser |
+| `run_command` / file / subagent tools | client-side | Yes | — (local, firewall-governed) |
+| MCP tools via the gateway | client-side | Yes | — (the gateway is the choke point; see "MCP gateway") |
+
+**Decision (the operator, 2026-11-24):** the tier ships with the accepted rows as they
+stand. No settings deny and no wrapper refusal stands in for one, and `SECURITY.md`
+lists them out of scope rather than as open findings.
+
 ## Capability inventory (v1)
 
 Workload: greenfield coding. Work I/O: git remotes (clone/pull/push) + a
@@ -846,8 +872,10 @@ host-bind-mounted workspace. Dependencies: pull-through cache.
   `ANTHROPIC_API_KEY`. When the account is **org-governed**, that login is also what
   places the sandbox under the org's remote server-managed settings — a
   personal-subscription login would not carry those (see "Managed settings are NOT an
-  enforcement lever here"). Low-risk read-only tokens (e.g. a search API key) are
-  also acceptable here.
+  enforcement lever here"). For agy it is the Google login of `agy`'s own headless
+  URL-and-code flow, whose token is a file in `antigravity-sandbox-config`, never
+  `GEMINI_API_KEY` or application-default credentials. Low-risk read-only tokens
+  (e.g. a search API key) are also acceptable here.
 - Governed / not in sandbox: git push token, MCP server credentials (held by the
   gateway), any write-capable / high-impact key.
 
@@ -1891,9 +1919,12 @@ which sandbox raised an ask. Claude's tier mints a random id each boot
 (`claude-sandbox/tier-setup.sh`) and writes it literally into the gateway entry as the
 `X-Dockade-Sandbox` header, which Claude Code sends on every request (NOTES.md, "An
 `http` MCP server's `headers` reach the server on every request", also on why
-literally). The gateway relays it only in its minted shape (`app.sandbox_id`), the
-bridge checks that shape again, and the ask records the id and joins on it, so asks
-with two ids never share a card. A tier or an older image that sends no id records
+literally). agy's tier mints its own the same way (`antigravity-sandbox/tier-setup.sh`)
+into the `headers` of its per-container gateway entry, which agy sent on every `/mcp`
+request in a probe on 1.5.16 (`NOTES.md` → "agy behind dockade's proxy, measured
+before its tier"). The gateway relays it only in its minted shape (`app.sandbox_id`),
+the bridge checks that shape again, and the ask records the id and joins on it, so
+asks with two ids never share a card. A tier or an older image that sends no id records
 none, and its asks join only other asks with none. An operator sees only the first 8
 characters, which the sandbox prints at boot: on the card, in the `hold` row's reason,
 in the pin panel and in the audit of a timed pin, never the whole id. The id is the
@@ -2226,6 +2257,15 @@ rather than whatever the config volume happens to have accumulated. The baked
 `CLAUDE.md` must also say that a gateway tool call can come back as a pending id, and
 that resuming it may wait on a human, or an `ask` is indistinguishable from a failure.
 
+**agy has none of those flags, so its tier takes the weaker channel.** agy reads MCP
+servers from `~/.gemini/config/mcp_config.json` and from a workspace's
+`.agents/mcp_config.json`, takes no flag naming a file, and has no strict mode. So
+`antigravity-sandbox/tier-setup.sh` writes the gateway entry into the user-owned file
+on each boot, per container and never in the config volume, since it carries the
+boot's sandbox id. The agent can edit it, and a workspace's file adds servers beside
+it: steering, not capability, for the reason above. Its tool surface is reviewable in
+the repo only as far as the image's file goes.
+
 ### Task registry — an MCP server with an operator side
 
 The work list agent sessions and the operator share. Who writes what, and why, is in
@@ -2415,7 +2455,7 @@ containment posture. One row per launcher, built or planned:
 | --- | --- | --- | --- | --- | --- |
 | `run-claude-sandbox.sh` | 1 | Claude (Anthropic API) | proxy → allowlist; Anthropic's lifeline unheld | Anthropic session login, in `claude-sandbox-config` | egress proxy + control plane |
 | `run-codex-sandbox.sh` (planned) | 1 | Codex (OpenAI) | proxy → allowlist; its model host held on first use | OpenAI session login, in a config volume of its own | egress proxy + control plane |
-| `run-antigravity-sandbox.sh` (planned) | 1 | Antigravity, `agy` (Google) | proxy → allowlist; its model host held on first use | Google session login, in a config volume of its own | egress proxy + control plane |
+| `run-antigravity-sandbox.sh` | 1 | Antigravity, `agy` (Google) | proxy → allowlist; its model host held on first use | Google session login, in `antigravity-sandbox-config` | egress proxy + control plane |
 | `run-opencode-sandbox.sh` | 2 | local LLM | **none** | **none** | nothing to govern — no egress exists |
 
 Every tier-1 row is a cloud agent, and what a new one needs is already decided: its
@@ -2580,10 +2620,10 @@ build` does not accept — so it would mean diverging CI from `make verify-build
 property that makes CI reproducible locally. The measured cold build came in far below
 the 5–15 minutes that would have justified the divergence, so it buys nothing (that
 figure and the image sizes from the same run are in `NOTES.md`). Worth knowing that
-**tier 2 is smaller only by the browser tier 1 carries** — without it both came out
-at about 1.2 GB, despite tier 2 being the thinner *tier*: "thin client" describes where
-inference runs and what capability it holds, not the toolchain both tiers inherit
-from `sandbox-common`.
+**tier 2 is smaller only by the browser Claude's tier-1 image carries** — without it
+both came out at about 1.2 GB, despite tier 2 being the thinner *tier*: "thin client"
+describes where inference runs and what capability it holds, not the toolchain both
+tiers inherit from `sandbox-common`.
 
 *Each of the incidents above is recorded blow-by-blow in the commit that fixed it, which
 is the copy that is dated and cannot drift. What is kept here is the resulting invariant.*
@@ -2592,9 +2632,9 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 
 | Step | What | State |
 |------|------|-------|
-| — | sandbox image + launcher, both tiers | **done** |
+| — | sandbox image + launcher, Claude's tier 1 and tier 2 | **done** |
 | — | tier-1 Codex sandbox — `run-codex-sandbox.sh` | planned |
-| — | tier-1 Antigravity sandbox — `run-antigravity-sandbox.sh` | planned |
+| — | tier-1 Antigravity sandbox — `run-antigravity-sandbox.sh` | **done** |
 | 0 | egress proxy, compose infra | **done** |
 | 1 | proxy is the sole egress (`sandbox-net` internal) | **done** |
 | 2a | control plane: policy store + audit | **done** |

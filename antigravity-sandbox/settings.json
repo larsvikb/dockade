@@ -1,0 +1,7 @@
+{
+  "enableTerminalSandbox": false,
+  "agentMode": "",
+  "permissions": {
+    "allow": ["read_file(/refs)"]
+  }
+}

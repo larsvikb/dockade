@@ -1544,7 +1544,7 @@ agent's own shell tool:
   `type rm` is not: on the reference machine the image's local model, given that
   request, ran a different and destructive command through its shell tool, so that
   probe gave no result.
-- **agy (Antigravity CLI, no tier yet): not seen.** Measured 2026-11-20 on agy 1.5.13
+- **agy (Antigravity CLI, tier 1): not seen.** Measured 2026-11-20 on agy 1.5.13
   in the tier-1 sandbox, with a scratch HOME holding copies of the shared `.bashrc`
   and the image's `.profile` (the setup is in "agy behind dockade's proxy, measured
   before its tier"). No model-free way to call a tool was found in agy's CLI, so
@@ -1559,8 +1559,8 @@ agent's own shell tool:
   `ANTIGRAVITY_SOURCE_METADATA` naming that call. In each of two sessions the file
   read `rm is /usr/bin/rm`, flags `hBc` and `expand_aliases off`.
 
-So the instructions' `rm` bullet holds for tier 1 and is false for tier 2, where a
-bulk `rm` deletes. It would be false for an agy tier too. The bullet is the
+So the instructions' `rm` bullet holds for Claude's tier and is false for tier 2,
+where a bulk `rm` deletes, and for agy's tier, so neither includes it. The bullet is the
 `sandbox-common/instructions/bashrc-shell/rm.md` fragment, and the rule for which
 tiers include it is in `sandbox-common/instructions/render.py`'s docstring. The
 image installs opencode `latest`: a re-run on a later release that prints "aliased"
@@ -1784,6 +1784,74 @@ sibling container's boot, by inference, not proof. Checksums of
 the end of the run both files still matched the image's copies.
 `/config/.claude.json` changed, but Claude Code rewrites it throughout a session, so
 the checksums cannot tell agy's writes from Claude's there.
+
+**agy 1.5.16, without a login (2026-11-24).** The installer's manifest named 1.5.16
+that day. Run as above (scratch HOME under `/tmp`, `env -i`, the logging relay, a
+fixture dir as cwd), with nothing signed in. A `find -newer` afterwards found no agy
+write outside the scratch dir, which was then removed.
+
+- *The gateway's header.* `~/.gemini/config/mcp_config.json` held
+  `{"mcpServers":{"gateway":{"url":…,"headers":{"X-Dockade-Sandbox":"<32 hex>"}}}}`
+  pointed at a local fake MCP server. The header arrived on every request to `/mcp`,
+  each POST and the SSE GET, before any login. Only the two OAuth discovery GETs, to
+  `/.well-known/oauth-protected-resource` and the same with `/mcp` appended, lacked
+  it; the real gateway answers both 404. `agy mcp add --header "K: V"` also exists.
+- *Its first request.* 1.5.16 opens with `server/discover` (`Mcp-Protocol-Version:
+  2026-07-28`), then `initialize` (2025-11-25). The real gateway answers
+  `server/discover` with JSON-RPC `-32601`, "not served here". Given that same answer
+  by the fake, agy fell back to `initialize`, `notifications/initialized` and
+  `tools/list`, the header on each. `agy mcp list` reads the config only and makes no
+  connection.
+- *User-level rules,* from the binary's embedded docs and changelog, not from
+  behaviour, which needs a login: `~/.gemini/GEMINI.md` or `~/.gemini/AGENTS.md`, or
+  the same names under `~/.gemini/config/`. A rule file is capped at 24,000 bytes,
+  and always-on and global rules share a 20,000-token budget, past which they are
+  demoted to path pointers. A workspace's `GEMINI.md` and `AGENTS.md` are read from
+  the cwd up to the repo root.
+- *Settings,* from the same docs: the user file is
+  `~/.gemini/antigravity-cli/settings.json`, and per-project configs under
+  `~/.gemini/config/projects/` take precedence over it. `--settings` takes a JSON
+  object inline or a file path, "for this session only, never saved"; its precedence
+  against the user file is not documented. `agy -p /settings` asks for a login.
+- *The default mode* changed in 1.5.16 to Auto wherever an account offers it,
+  print mode included; `"agentMode": ""` in `settings.json` keeps the default mode.
+  The Starter account measured above offered no Auto.
+- *The release tarball* (`cli_linux_x64.tar.gz`) holds one file, `antigravity`,
+  which the installer copies to `agy`. Its sha512 matched the manifest's.
+  `antigravity --version` printed `1.5.16` in about a tenth of a second with no
+  network variables set, and wrote nothing to its HOME. With the gateway entry above
+  and `{"enableTerminalSandbox":false,"agentMode":"","permissions":{"allow":["read_file(/refs)"]}}`
+  as its user settings, `agy mcp list` listed `gateway`, `http`, `enabled`.
+
+**agy 1.5.16 in its own tier, signed in (2026-11-25).** The operator ran the host
+check for #308 on the reference machine: `make agy` from the branch, then plain
+`agy` (not `agy-yolo`) with the image's settings, signed in with the URL and the
+pasted code. The operator answered the holds and reported each result to the
+session that built the tier.
+
+- *Login.* Headless sign-in works in the image. A second `make agy` needed no new
+  login, so the token in the config volume survives a container restart.
+- *The gateway.* The model listed the gateway's tools by their bare names
+  (`tasks__…`, `mcp-github__…`, `resume_tool_call`, `withdraw_tool_call`). So the
+  real gateway's `-32601` on `server/discover` leads to `initialize` as the fake's
+  did. agy keeps the tool definitions under
+  `~/.gemini/antigravity-cli/mcp/gateway/`, which is in the volume.
+- *The sandbox id.* A call to `mcp-github__create_pull_request` was held, and the
+  card read `sandbox f2387a08`, the prefix that boot printed. The operator then
+  denied one held call and had agy withdraw another; both ended the call.
+- *Asking.* Plain `agy` asked before every command and before the gateway call,
+  which the gateway then held as well: two approvals for one gateway call (#446).
+- *The session id.* `$DOCKADE_SESSION_ID` read the same in agy's own `run_command`
+  and in a subagent's.
+- *Settings after a run.* agy rewrote `settings.json`. It kept `"agentMode": ""`
+  and the `read_file(/refs)` allow, dropped `"enableTerminalSandbox": false`, and
+  added `"trustedWorkspaces": ["/workspace/dockade"]`. A second `agy` in the same
+  container, reading that file, still ran `touch` with exit 0, so in 1.5.16 the
+  dropped key leaves the terminal sandbox off. #328 found it on by default in
+  1.5.13. The workspace trust lives in that file, so the hook's rewrite at boot
+  drops it, and agy asks again after every restart (#445).
+- *Boundary.* `./run-antigravity-sandbox.sh --boundary-check` passed all 29 checks,
+  among them `daily-cloudcode-pa.googleapis.com` reachable through the proxy.
 
 ## Local inference and the accelerator survey: in `opencode-sandbox/NOTES.md`
 

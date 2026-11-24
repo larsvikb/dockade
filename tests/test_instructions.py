@@ -39,7 +39,8 @@ class DriftTests(unittest.TestCase):
 
     def test_each_output_is_a_fresh_render_of_its_source(self):
         self.assertEqual(set(render.render_all()),
-                         {"claude-sandbox/user-CLAUDE.md", "opencode-sandbox/user-AGENTS.md"})
+                         {"claude-sandbox/user-CLAUDE.md", "opencode-sandbox/user-AGENTS.md",
+                          "antigravity-sandbox/user-AGENTS.md"})
         for path in render.sources():
             source = render.parse(path)
             with self.subTest(source=source.path):

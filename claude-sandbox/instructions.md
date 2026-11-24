@@ -1,6 +1,7 @@
 ---
 output: claude-sandbox/user-CLAUDE.md
 gateway_prefix: mcp__gateway__
+gateway_tools: under `mcp__gateway__`
 web_fetch_tool: WebFetch
 shell_tool: Bash
 agent_kind: claude

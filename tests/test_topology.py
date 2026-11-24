@@ -2638,6 +2638,49 @@ class EveryMultiHomedServiceForwardsNothingTests(unittest.TestCase):
             self.test_every_multi_homed_service_turns_forwarding_off()
 
 
+class SandboxToolchainPinsAgreeTests(unittest.TestCase):
+    """Each sandbox image that copies claude-sandbox/Dockerfile's toolchain copies its
+    pins too: the hadolint ARGs, which CI reads from Claude's file alone, and the
+    NodeSource major. A copy left behind on a bump would lint, or run node, with
+    another version than CI and the other images, and nothing at build time says so.
+    The apt set and the pipx installs are unpinned in every image, so there is nothing
+    of theirs to hold equal."""
+
+    CLAUDE = "claude-sandbox/Dockerfile"
+    HADOLINT = re.compile(r"^ARG (HADOLINT_[A-Z0-9_]+)=(\S+)$", re.M)
+    NODESOURCE = re.compile(r"deb\.nodesource\.com/setup_(\d+)\.x")
+
+    def _dockerfiles(self) -> dict[str, str]:
+        found = {p.relative_to(ROOT).as_posix(): p.read_text()
+                 for p in sorted(ROOT.glob("*-sandbox/Dockerfile"))}
+        self.assertIn(self.CLAUDE, found)
+        self.assertIn("antigravity-sandbox/Dockerfile", found)
+        return found
+
+    def test_every_hadolint_copy_carries_the_pins_ci_reads(self):
+        files = self._dockerfiles()
+        pins = dict(self.HADOLINT.findall(files[self.CLAUDE]))
+        self.assertEqual(set(pins), {"HADOLINT_VERSION", "HADOLINT_SHA256_X86_64",
+                                     "HADOLINT_SHA256_ARM64"})
+        copies = 0
+        for name, text in files.items():
+            found = self.HADOLINT.findall(text)
+            if not found and "hadolint/releases/download" not in text:
+                continue
+            copies += 1
+            with self.subTest(dockerfile=name):
+                self.assertEqual(sorted(found), sorted(pins.items()))
+        self.assertGreaterEqual(copies, 2)
+
+    def test_every_image_installs_one_nodesource_major(self):
+        majors = {name: self.NODESOURCE.findall(text)
+                  for name, text in self._dockerfiles().items()}
+        self.assertEqual(len(majors[self.CLAUDE]), 1)
+        for name, found in majors.items():
+            with self.subTest(dockerfile=name):
+                self.assertEqual(found, majors[self.CLAUDE])
+
+
 class EveryImageIsBuiltTests(unittest.TestCase):
     """`make verify-build` is the one check that a Dockerfile still builds, and compose
     builds only the services its active profiles enable. So a profile-gated service

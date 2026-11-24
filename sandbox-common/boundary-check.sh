@@ -527,7 +527,7 @@ for ref in /refs/*/; do
     fi
 done
 [ "$refs" -gt 0 ] || info "/refs not mounted (SANDBOX_REFS unset)"
-# The session's start directory. Both launchers set -w to /workspace/<folder-name> in
+# The session's start directory. Every launcher sets -w to /workspace/<folder-name> in
 # every mode, for the reason in DESIGN.md, "The checkout mounts at
 # /workspace/<folder-name>". A lost -w falls back to the images' WORKDIR /workspace
 # and fails, as does a cd out of the checkout; a subdirectory of it passes. Read

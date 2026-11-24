@@ -1417,9 +1417,18 @@ check-boundary: up ## Stand the infra up and assert containment from inside a th
 	# image if it is missing, and takes minutes.
 	#
 	# Deliberately NON-DESTRUCTIVE, because an operator may well run it against
-	# live infrastructure: `up` keeps the volumes and leaves any running agent
-	# session alone. It never calls `destroy` — the audit store is the crown
-	# jewel, and no test target gets to delete it.
+	# live infrastructure: `up` keeps the volumes, and nothing here calls
+	# `destroy` — the audit store is the crown jewel, and no test target gets to
+	# delete it. It does not leave running agent sessions untouched, though. `up`
+	# builds, so infra whose image or config changed since the last `up` is
+	# recreated under them. And the throwaway sandbox boots as any tier-1 launch
+	# does: its boot writes the config volume every running Claude sandbox shares
+	# (it reinstalls settings.json and the user CLAUDE.md) from its own image,
+	# which need not match a running session's (a newer build, or a JDK variant
+	# left unrebuilt), and a running session, or one started after, reads those
+	# writes. That boot touches running sessions as launching one more session
+	# would. The boot's writes are made in sandbox-common/entrypoint.sh and
+	# claude-sandbox/tier-setup.sh.
 	#
 	# `boundary` is the sibling for the case where you already HAVE a sandbox
 	# running (and is the only way to check tier 2, whose own probes need the local

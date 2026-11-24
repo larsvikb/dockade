@@ -15,6 +15,7 @@ constant appeasement gets deleted, and takes the useful ones with it.
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shutil
@@ -734,6 +735,104 @@ class LauncherRowTests(_NeedsGit):
                 self.assertIn(launcher, named,
                               f"{launcher} has no row in DESIGN.md's tier table, under "
                               f'"Tier 2, and what it shares with tier 1"')
+
+
+class BodylessRelayedRouteTests(unittest.TestCase):
+    """control-plane-ui/DESIGN.md, "The browser boundary", names the relayed POSTs that
+    take no body. They are why the Origin guard cannot lean on FastAPI refusing an
+    untyped body: a cross-site form POST reaches them with nothing to type. A no-body
+    route relayed later and left unnamed would make the list quietly short.
+
+    Both ends are read with ast, not imported, so the fastapi stub is not involved.
+    The relayed POSTs come from `_RELAY_ROUTES` in control-plane-ui/app.py. Each one
+    is matched to the `@router.post` handler in control-plane/api_*.py whose path,
+    with each `{param}` filled by a sample of its annotated type, its pattern accepts.
+    A handler takes a body when a parameter is annotated with a pydantic model, that
+    is a class in control-plane/ that derives from `BaseModel`. The names are read
+    from the sentence that lists them, between "take no body at all" and "none has":
+    each backticked name, a module prefix dropped, a lone `api_*` module skipped."""
+
+    SAMPLES: ClassVar[dict[str, str]] = {"int": "1", "str": "acme"}
+
+    @staticmethod
+    def _annotation(arg: ast.arg) -> str:
+        return arg.annotation.id if isinstance(arg.annotation, ast.Name) else ""
+
+    def _relayed_posts(self) -> list[str]:
+        tree = ast.parse((ROOT / "control-plane-ui" / "app.py").read_text())
+        table = next((n.value for n in tree.body if isinstance(n, ast.Assign)
+                      and [getattr(t, "id", None) for t in n.targets] == ["_RELAY_ROUTES"]),
+                     None)
+        self.assertIsInstance(table, ast.Tuple, "control-plane-ui/app.py has no "
+                              "_RELAY_ROUTES tuple")
+        posts = [entry.elts[1].args[0].value for entry in table.elts
+                 if entry.elts[0].value == "POST"]
+        self.assertTrue(posts, "_RELAY_ROUTES relays no POST")
+        return posts
+
+    def _handlers(self) -> list[tuple[str, str, bool]]:
+        """(path, function name, takes a body) for every control-plane POST handler."""
+        trees = [ast.parse(p.read_text()) for p in sorted((ROOT / "control-plane").glob("*.py"))]
+        bases = {c.name: {b.id for b in c.bases if isinstance(b, ast.Name)}
+                 for t in trees for c in ast.walk(t) if isinstance(c, ast.ClassDef)}
+        models, grew = {"BaseModel"}, True
+        while grew:
+            grew = False
+            for name, parents in bases.items():
+                if name not in models and parents & models:
+                    models.add(name)
+                    grew = True
+        handlers = []
+        for path in sorted((ROOT / "control-plane").glob("api_*.py")):
+            for fn in ast.walk(ast.parse(path.read_text())):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for dec in fn.decorator_list:
+                    if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+                            and dec.func.attr == "post"):
+                        url = dec.args[0].value
+                        types = {a.arg: self._annotation(a) for a in fn.args.args}
+                        sample = re.sub(r"\{(\w+)\}",
+                                        lambda m: self.SAMPLES[types[m.group(1)]], url)
+                        body = any(t in models for t in types.values())
+                        handlers.append((sample, fn.name, body))
+        self.assertTrue(handlers, "no @router.post handler found in control-plane/api_*.py")
+        return handlers
+
+    def _named(self) -> set[str]:
+        design = (ROOT / "control-plane-ui" / "DESIGN.md").read_text()
+        m = re.search(r"take no body at all(.*?)none has", design, re.S)
+        self.assertIsNotNone(m, "control-plane-ui/DESIGN.md no longer lists the "
+                             "relayed routes that take no body")
+        names = {t.rsplit(".", 1)[-1] for t in re.findall(r"`([\w.]+)`", m.group(1))
+                 if not re.fullmatch(r"api_\w+", t)}
+        self.assertTrue(names, "the list of routes that take no body names none")
+        return names
+
+    def _bodyless(self, posts: list[str], handlers: list[tuple[str, str, bool]]) -> set[str]:
+        bodyless = set()
+        for pattern in posts:
+            matched = [(name, body) for sample, name, body in handlers
+                       if re.fullmatch(pattern, sample)]
+            self.assertEqual(len(matched), 1, f"relayed POST {pattern} matches "
+                             f"{len(matched)} control-plane handlers, not one")
+            bodyless |= {name for name, body in matched if not body}
+        return bodyless
+
+    def test_a_relayed_post_must_match_exactly_one_handler(self):
+        # A pattern no handler answers, or one two handlers answer, would leave the
+        # set below short or ambiguous; the real tree has neither, so this holds it.
+        handlers = [("/a/1/revoke", "revoke_a", False), ("/b/1/revoke", "revoke_b", False)]
+        self.assertEqual(self._bodyless([r"^/a/[0-9]+/revoke$"], handlers), {"revoke_a"})
+        for pattern in (r"^/c$", r"^/[ab]/[0-9]+/revoke$"):
+            with self.subTest(pattern=pattern), self.assertRaises(AssertionError):
+                self._bodyless([pattern], handlers)
+
+    def test_the_paragraph_names_exactly_the_relayed_routes_that_take_no_body(self):
+        bodyless = self._bodyless(self._relayed_posts(), self._handlers())
+        self.assertEqual(self._named(), bodyless,
+                         'control-plane-ui/DESIGN.md, "The browser boundary", must name '
+                         "every relayed POST that takes no body, and only those")
 
 
 class JdkVariantDocTests(unittest.TestCase):

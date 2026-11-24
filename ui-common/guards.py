@@ -19,13 +19,15 @@ guards (`request_guard`) stand in front of every route:
      class rather than raising its cost.
   2. **Cross-origin state change refused** — closes CSRF, and it is load-bearing
      rather than belt-and-braces. A JSON body does NOT force a preflight: a `Blob`
-     with no type is sent with no `Content-Type`, which is CORS-safelisted, and
-     FastAPI parses an untyped body as JSON. Nor does an unguessable id cover every
-     write: a route that takes no id, such as creating an egress rule, needs none to
-     be forged. So the relationship
-     has to be checked: `Sec-Fetch-Site` when the browser sends it, else `Origin`
-     compared as a full authority (host AND port) against the request's own Host,
-     because a page on another localhost port is another origin.
+     with no type is sent with no `Content-Type`, which is CORS-safelisted. FastAPI's
+     `strict_content_type` default declines to read that untyped body as JSON, but
+     that is a framework default this guard does not rest on. Nor does an unguessable
+     id cover every write: a route keyed by a sequential id or a name, such as
+     revoking an egress lease, has nothing unguessable to forge, and one that takes no
+     body has nothing to type either (control-plane-ui/DESIGN.md, "The browser
+     boundary", names them). So the relationship has to be checked: `Sec-Fetch-Site` when the browser sends it, else
+     `Origin` compared as a full authority (host AND port) against the request's own
+     Host, because a page on another localhost port is another origin.
   3. **Refusal to be EMBEDDED** (`frame-ancestors 'none'` in the CSP, plus a
      `Sec-Fetch-Dest` check) — closes CLICKJACKING, which guards 1 and 2 cannot see.
      An attacker page that frames a UI sends a perfectly legitimate

@@ -19,9 +19,16 @@ preflight and responses are readable — it can list the pending approvals (obta
 the `uuid4` ids a blind attacker cannot guess) and resolve them. That is the vector
 that matters most here, but plain CSRF is not self-blocking either, as this once
 claimed: a JSON body does not force a preflight (a typeless `Blob` is sent with no
-`Content-Type`, which is CORS-safelisted, and FastAPI parses an untyped body as
-JSON). The `resolve` id is blind for a tool ask too: the agent is handed a resume
-token, never the id (DESIGN.md, "Resumption is a tool, keyed on a resume token").
+`Content-Type`, which is CORS-safelisted). FastAPI's `strict_content_type` default
+declines to read that untyped body as JSON, so a route with a body model (`resolve`
+among them, and every route that grants) answers 422 to it. The guard does not rest on
+that: it is a framework default nothing here sets or tests, and some relayed
+state-changing routes take no body at all, so there is nothing to type. Those are
+`api_egress.revoke_lease`, and `api_mcp`'s `revoke_mcp_rule` and `revoke_mcp_pin`,
+keyed by a sequential id, and `revoke_mcp_server`, keyed by the server's name: none has
+a `uuid4` to guess, and a cross-site form POST reaches each without a preflight. Today
+they only revoke. The `resolve` id is blind for a tool ask too: the agent is handed a
+resume token, never the id (DESIGN.md, "Resumption is a tool, keyed on a resume token").
 Four structural guards sit in front: three that every UI installs from
 `ui-common/guards.py`, and the relay's own table in
 `control-plane-ui/app.py`:

@@ -384,12 +384,12 @@ install -m 0644 /etc/claude-code/user-settings.json "$CONFIG_DIR/settings.json"
 
 # User-scope CLAUDE.md, on the same terms and for the same reasons as the
 # settings above: baked in the image, overwritten every boot, transient if the
-# agent edits it. Its content is the container's CAPABILITY facts — no egress but
-# the proxy, no push, no docker, the checkout shared with the host — which the agent
-# otherwise rediscovers one failed command at a time. Enablement, not enforcement:
-# an agent that ignores the file is stopped by the firewall exactly as before.
-# Deliberately says nothing about how to work in the repo; that is the repo's own
-# CLAUDE.md, which travels with the checkout and is loaded alongside this.
+# agent edits it. The baked text is the container's CAPABILITY facts — no egress
+# but the proxy, no push, no docker, the checkout shared with the host — which the
+# agent otherwise rediscovers one failed command at a time. Enablement, not
+# enforcement: an agent that ignores the file is stopped by the firewall exactly as
+# before. Deliberately says nothing about how to work in the repo; that is the
+# repo's own CLAUDE.md, which travels with the checkout and is loaded alongside this.
 # The text is edited in claude-sandbox/instructions.md and the fragments it
 # includes from sandbox-common/instructions/, then rendered (make instructions).
 #
@@ -398,6 +398,13 @@ install -m 0644 /etc/claude-code/user-settings.json "$CONFIG_DIR/settings.json"
 # put the same text in context twice. The extension is what keeps the baked copy
 # inert. See the Dockerfile comment and NOTES.md.
 install -m 0644 /etc/claude-code/CLAUDE.md.template "$CONFIG_DIR/CLAUDE.md"
+# Then the operator's own, from ~/.config/dockade/claude/CLAUDE.md on the host, when
+# the launcher mounted one, under a heading after the baked text. Into the shared
+# volume like the rest of this file: it is per machine, so every sibling appends the
+# same text. /operator is nowhere Claude Code looks on its own, so it loads once.
+# shellcheck source=sandbox-common/operator-instructions.sh
+source /usr/local/lib/dockade/operator-instructions.sh
+append_operator_instructions "/operator/CLAUDE.md" "$CONFIG_DIR/CLAUDE.md"
 
 
 # Said here rather than by the render, which root runs once and whose warnings

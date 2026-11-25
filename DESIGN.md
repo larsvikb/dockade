@@ -369,8 +369,9 @@ embedded credentials — while the exact figure is already local and free.
 ### Durable host config lives outside the repo (`~/.config/dockade`)
 
 Per-machine settings that outlive a launch — MCP client credentials
-(`MCP_SECRETS`), plugin marketplace checkouts, the enabled-plugin allowlist — live
-under `$XDG_CONFIG_HOME/dockade` (default `~/.config/dockade`), **never in this
+(`MCP_SECRETS`), plugin marketplace checkouts, the enabled-plugin allowlist, and a
+folder per tier for the operator's own additions to it (`claude/`, `opencode/`,
+`agy/`; see "Operator customization") — live under `$XDG_CONFIG_HOME/dockade` (default `~/.config/dockade`), **never in this
 tree**. The reason is specific to this repo rather than convention: a sandbox
 launched with dockade as its workspace bind-mounts the tree **read-write**, so
 anything configured from inside it is agent-writable. For a credential that is
@@ -442,7 +443,9 @@ Five decisions worth keeping:
   One launch cannot see another's workspace, so the sibling's side is closed by
   every launch's workspace guard instead: it refuses a workspace that is, holds or
   lies inside the config home, or holds a link, directory or missing name on the
-  way to it or its entries (`_sc_config_home_reason`). A sibling can still write
+  way to it, its entries, each tier's folder or what is in one
+  (`_sc_config_home_reason`). The marketplaces check is shared with the operator's
+  files (`_sc_ro_workspace_reason`). A sibling can still write
   this launch's marketplaces when they are an explicit `SANDBOX_MARKETPLACES_DIR`
   outside the config home; when its guard is not this one (launched with
   `ALLOW_UNSAFE_WORKSPACE`, from an older checkout, or with another
@@ -517,9 +520,10 @@ Host directories the operator lists in `SANDBOX_REFS` are mounted read-only at
 capability, so every tier gets them, and it is enablement rather than a widening
 of the boundary — provided what is mounted is only files.
 
-- **One guard for every read-only mount.** `/refs` and `/marketplaces` refuse the
-  same paths through one function (`_sc_ro_mount_reason`), because what a
-  read-only mount exposes does not depend on why the directory was mounted.
+- **One guard for every read-only mount.** `/refs`, `/marketplaces` and the
+  operator's files under `/operator` refuse the same paths through one function
+  (`_sc_ro_mount_reason`), because what a read-only mount exposes does not depend
+  on why the path was mounted.
 - **`:ro` is not "only readable".** A unix socket under a read-only bind can still
   be connected to and a FIFO written (measured; `NOTES.md`), and the sandbox user
   has the host's uid, so a mounted tmux or ssh-agent socket is host command
@@ -563,6 +567,75 @@ of the boundary — provided what is mounted is only files.
   agy's allow goes. Its content is still untrusted input — a ref can steer the agent
   the way any file it reads can — and is bounded by the same egress and tool
   governance as everything else.
+
+### Operator customization — `~/.config/dockade/<tier>/`, extending a tier per machine
+
+The operator extends a tier on their own machine from one folder per tier in the
+config home (`claude/`, `opencode/`, `agy/`), each file in that tier CLI's own format
+(`sc_tier_config_dir` in `sandbox-lib.sh`; `_SC_TIERS` lists the tiers). It is host
+config like the rest of the config home, so it follows "Durable host config lives
+outside the repo": never a file in this tree, which a sandbox can write. The
+alternative it replaces is editing the repo, which ships the change to everyone.
+
+- **Extendable, each by its own route** (the Status table tracks which are built):
+  - **instructions**: `CLAUDE.md`, or `AGENTS.md` for opencode and agy, appended at
+    each boot after the tier's baked user-scope instructions, under a heading naming
+    the text below it as the operator's and everything above as dockade's
+    (`sandbox-common/operator-instructions.sh`). **Append only**: the baked text is
+    the container's capability facts, and overriding them can only make the agent
+    wrong about the container.
+  - **image tooling**: the operator's own layer built from the tier's image, registry
+    task 427.
+  - **user settings**: merged over the tier's baked ones, registry task 429. It
+    revises the argument under "Plugin marketplaces" against a host-supplied
+    settings overlay, which stands until then.
+- **Fixed, whatever the operator's config says**: the firewall, the entrypoint, the
+  non-root user, the mounts, and egress policy, which has its own surface in the
+  control plane. The operator is trusted; the point is that a *mistake* in local
+  config cannot switch containment off, because the boundary is capability, not
+  configuration.
+- **Not duplicated**: skills, agents and hooks already reach a session from the
+  host through plugin marketplaces, and a user's own MCP servers are registry task
+  166. This layer adds no second route for either.
+- **Each file mounted alone, read-only, at `/operator/<name>`** (`sc_operator_config`),
+  never the folder, so the sandbox gets no host path it does not need. It is refused
+  as every read-only mount refuses, and when the workspace could write it or a link
+  on the way to it, whatever `ALLOW_UNSAFE_WORKSPACE` says, since a later launch
+  would append what the agent wrote. The workspace guard walks every tier's folder
+  and what is in it, a sibling tier's included (`_sc_config_home_reason`). The
+  sibling cases "Plugin marketplaces" leaves open stay open here: a sibling launched
+  with the override, from an older checkout or under another config home can write
+  a tier file linked into its workspace. Read-only is asserted twice, as for
+  `/refs`. The sandbox user reads the file at boot, never root, and `/operator` is
+  nowhere any tier's CLI looks on its own, so the text loads once, from the
+  appended copy.
+- **Shown at launch**: the banner's `Custom:` line names each active customization,
+  and a launch with none prints what it did before, so a session that behaves
+  differently from stock is explainable from its launch output. It says what was
+  mounted, not what took effect: an image older than the append (built only when
+  missing, until `--rebuild`) mounts the file and appends nothing, as does a file of
+  only whitespace.
+- **Materialized where the tier's baked instructions are.** For Claude and opencode
+  that is the shared config volume, which is consistent because these files are per
+  machine rather than per launch, so every sibling of a tier writes the same text,
+  unlike a launch's refs or plugins, which stay in its own `/etc`. agy installs its
+  instructions per container, in `~/.gemini`, so its append is per container too and
+  none of what follows applies to it. Two exceptions: launches
+  under different `DOCKADE_CONFIG_HOME` or `XDG_CONFIG_HOME` read different folders,
+  and a sibling booting from an older image rewrites the file without the append;
+  either way the volume holds the last boot's. Two siblings booting at the same
+  moment can interleave one's install with the other's append, leaving the
+  operator's text in the file twice until the next boot: a repeat, harmless, and
+  not worth a lock.
+- **Credential-shaped values warn, never refuse.** Where the operator's config
+  carries a value into the sandbox (an `ENV` or `ARG` in the image layer, the `env`
+  key in the settings), a name that looks like a credential draws a warning naming
+  it, from one shared name list that registry task 429 brings. A warning, because a name
+  heuristic cannot be trusted to block a launch. The invariant it points at stands:
+  write-capable credentials never live in the sandbox (`CLAUDE.md`).
+- **Readable by the agent, and paid for in context.** Instructions exist to be read,
+  so nothing secret belongs in them; and on opencode's 24k window every line of an
+  `AGENTS.md` comes out of what the session has left.
 
 ### Git identity — from the host at launch, not the tree
 
@@ -898,7 +971,8 @@ under the MCP gateway for the file's shape and why a directory bind beats a comp
 selection, the render gid, a port.
 
 **Workspace bind-mount:** the one deliberate writable host coupling (the
-read-only ones are `/marketplaces` and `/refs`). Scope it to a
+read-only ones are `/marketplaces`, `/refs` and the operator's files under
+`/operator`). Scope it to a
 single project directory, read-write. Because work lands on the host FS directly,
 no separate artifact-export path is needed in v1.
 
@@ -2635,6 +2709,9 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | sandbox image + launcher, Claude's tier 1 and tier 2 | **done** |
 | — | tier-1 Codex sandbox — `run-codex-sandbox.sh` | planned |
 | — | tier-1 Antigravity sandbox — `run-antigravity-sandbox.sh` | **done** |
+| — | operator customization from `~/.config/dockade/<tier>/` — instructions appended at boot, the banner's `Custom:` line | **done** |
+| — | operator customization — the operator's own image layer | planned |
+| — | operator customization — user settings merged over the baked ones | planned |
 | 0 | egress proxy, compose infra | **done** |
 | 1 | proxy is the sole egress (`sandbox-net` internal) | **done** |
 | 2a | control plane: policy store + audit | **done** |

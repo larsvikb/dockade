@@ -518,8 +518,9 @@ class TierHookPrivilegeTests(unittest.TestCase):
         self.assertLess(rendered, written)
 
     def test_the_user_phase_writes_no_launch_state_into_the_volume(self):
-        # settings.json and CLAUDE.md in the volume are the image's templates and
-        # nothing more; the launch's plugins and their note are root's, in /etc.
+        # settings.json in the volume is the image's template and nothing more, and
+        # CLAUDE.md the template with the operator's per-machine text after it; the
+        # launch's plugins and their note are root's, in /etc.
         user_phase = TIER_SETUP.split(self.REEXEC, 1)[1]
         code = self._code(user_phase)
         self.assertEqual(
@@ -527,10 +528,111 @@ class TierHookPrivilegeTests(unittest.TestCase):
             ['install -m 0644 /etc/claude-code/user-settings.json "$CONFIG_DIR/settings.json"'])
         self.assertEqual(
             [line for line in code if "CLAUDE.md" in line],
-            ['install -m 0644 /etc/claude-code/CLAUDE.md.template "$CONFIG_DIR/CLAUDE.md"'])
+            ['install -m 0644 /etc/claude-code/CLAUDE.md.template "$CONFIG_DIR/CLAUDE.md"',
+             'append_operator_instructions "/operator/CLAUDE.md" "$CONFIG_DIR/CLAUDE.md"'])
         self.assertEqual([line for line in code if "launch-settings.json" in line],
                          ["plugin_advisory /etc/claude-code/launch-settings.json \\"])
         self.assertNotIn(">>", "\n".join(code))
+
+
+class OperatorInstructionsWiringTests(unittest.TestCase):
+    """The operator's instructions file, from each launcher's mount to its tier's boot.
+
+    tests/test_launcher_lib.py runs ``sc_operator_config`` and
+    tests/test_operator_instructions.py the append; a launcher that dropped the flags,
+    named a file its hook does not read, or a hook that wrote the file anywhere else,
+    would pass both."""
+
+    HELPER = "/usr/local/lib/dockade/operator-instructions.sh"
+    GUARD = ('sc_guard_workspace "$WORKSPACE"\nWORKSPACE="$SC_WORKSPACE"\n'
+             'sc_workspace_mount "$WORKSPACE"\n')
+    CALL = re.compile(r'^sc_operator_config (\S+) "\$WORKSPACE" (\S+)$', re.M)
+
+    def tiers(self) -> list[str]:
+        found = re.findall(r"^_SC_TIERS=\((.*)\)$", LIB, re.M)
+        self.assertEqual(len(found), 1, found)
+        return found[0].split()
+
+    def wiring(self):
+        """(launcher name, its text, tier, file, image dir) for each launcher."""
+        for path in launchers(ROOT):
+            text = path.read_text()
+            calls = self.CALL.findall(text)
+            self.assertEqual(len(calls), 1, f"{path.name}: {calls}")
+            image_dir = re.findall(r'^IMAGE_DIR="([^"]+)"$', text, re.M)
+            self.assertEqual(len(image_dir), 1, path.name)
+            yield path.name, text, calls[0][0], calls[0][1], image_dir[0]
+
+    def test_each_launcher_names_a_known_tier_once_and_tiers_are_not_shared(self):
+        seen = [tier for _, _, tier, _, _ in self.wiring()]
+        self.assertTrue(seen)
+        self.assertEqual(sorted(seen), sorted(set(seen)))
+        for tier in seen:
+            with self.subTest(tier=tier):
+                self.assertIn(tier, self.tiers())
+
+    def test_each_launcher_passes_its_workspace_after_the_guard_set_it(self):
+        for name, text, _, _, _ in self.wiring():
+            with self.subTest(launcher=name):
+                guard = text.index(self.GUARD)
+                call = self.CALL.search(text).start()
+                self.assertLess(guard, call)
+                # Nothing reassigns WORKSPACE between the guard and the call.
+                self.assertNotRegex(text[guard + len(self.GUARD):call], r"(?m)^\s*WORKSPACE=")
+                self.assertLess(call, text.index("\ndocker run "))
+
+    def test_each_launcher_mounts_the_flags_and_prints_the_custom_line(self):
+        for name, text, _, _, _ in self.wiring():
+            with self.subTest(launcher=name):
+                run = text[text.index("\ndocker run "):]
+                self.assertEqual(text.count("SC_OPERATOR_ARGS"), 2)
+                self.assertIn('    ${SC_OPERATOR_ARGS[@]+"${SC_OPERATOR_ARGS[@]}"} \\\n', run)
+                self.assertIn('[[ -z "$SC_CUSTOM_DESC" ]] || echo "Custom:    $SC_CUSTOM_DESC"\n',
+                              text)
+
+    def test_the_mount_is_at_operator_never_where_a_cli_loads_on_its_own(self):
+        # Claude Code loads a CLAUDE.md from /etc/claude-code and from its config
+        # directory, opencode from its config directory: a file mounted there would
+        # load once as mounted and again as appended.
+        self.assertEqual(re.findall(r"SC_OPERATOR_ARGS\+=.*", LIB),
+                         ['SC_OPERATOR_ARGS+=(-v "$real":/operator/"$name":ro)'])
+        for path in [*launchers(ROOT), ROOT / "sandbox-lib.sh"]:
+            for target in re.findall(r'-v "[^"]*":("?/[^: ]*)', path.read_text()):
+                with self.subTest(file=path.name, target=target):
+                    self.assertFalse(target.startswith(("/etc/", "/config/", "/home/")), target)
+
+    def test_each_dockerfile_copies_the_helper_where_its_hook_sources_it(self):
+        for _, _, _, _, image_dir in self.wiring():
+            with self.subTest(image=image_dir):
+                dockerfile = (ROOT / image_dir / "Dockerfile").read_text()
+                self.assertEqual(dockerfile.count(
+                    f"COPY sandbox-common/operator-instructions.sh {self.HELPER}\n"), 1)
+                self.assertIn(f"               {self.HELPER} \\\n", dockerfile)
+
+    def test_each_hook_appends_the_launchers_file_onto_its_install_and_nothing_else(self):
+        for _, _, _, file, image_dir in self.wiring():
+            with self.subTest(image=image_dir):
+                hook = (ROOT / image_dir / "tier-setup.sh").read_text()
+                root_phase, user_phase = hook.split(TierHookPrivilegeTests.REEXEC, 1)
+                self.assertNotIn("/operator/", root_phase)
+                self.assertNotIn("append_operator_instructions", root_phase)
+                code = TierHookPrivilegeTests._code(user_phase)
+                named = [line for line in code if file in line]
+                self.assertEqual(len(named), 2, named)
+                # From the image (/etc, or agy's $IMAGE_DIR, which is /etc/antigravity)
+                # into the config volume or, for agy, the container's own home.
+                install = re.fullmatch(
+                    r'install -m 0644 ("?(?:/etc/|\$IMAGE_DIR/)\S+\.template"?) '
+                    r'("\$(?:CONFIG_DIR|HOME)/\S+")', named[0])
+                self.assertIsNotNone(install, named[0])
+                self.assertTrue(install.group(2).endswith(f'/{file}"'), named[0])
+                self.assertEqual(named[1],
+                                 f"append_operator_instructions \"/operator/{file}\" {install.group(2)}")
+                sources = [line for line in code if self.HELPER in line]
+                self.assertEqual(sources, [f"source {self.HELPER}"])
+                self.assertLess(code.index(sources[0]), code.index(named[1]))
+                self.assertEqual([line for line in code if "/operator/" in line], [named[1]])
+                self.assertNotIn(">>", "\n".join(code))
 
 
 if __name__ == "__main__":

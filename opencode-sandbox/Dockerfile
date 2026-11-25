@@ -149,12 +149,16 @@ COPY opencode-sandbox/user-AGENTS.md /etc/opencode/AGENTS.md.template
 COPY sandbox-common/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY sandbox-common/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
+# Sourced by tier-setup.sh, not run, so not on PATH: appends the operator's own
+# instructions, when the launcher mounted them, after the baked AGENTS.md.
+COPY sandbox-common/operator-instructions.sh /usr/local/lib/dockade/operator-instructions.sh
 # Dotfiles: the tier-agnostic ones shared with every tier, plus this tier's hook
 # (the `oc` alias and a prompt that tells this tier's sandbox from the others).
 COPY sandbox-common/dotfiles/.bashrc sandbox-common/dotfiles/.vimrc \
      sandbox-common/dotfiles/.inputrc sandbox-common/dotfiles/.gitconfig /home/$USERNAME/
 COPY opencode-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier
 RUN chmod 0644 /etc/opencode/opencode.json /etc/opencode/AGENTS.md.template \
+               /usr/local/lib/dockade/operator-instructions.sh \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
                   /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \
     && chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc /home/$USERNAME/.bashrc.tier \

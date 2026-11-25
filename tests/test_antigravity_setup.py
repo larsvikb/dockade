@@ -27,6 +27,8 @@ TIER = ROOT / "antigravity-sandbox"
 HOOK = (TIER / "tier-setup.sh").read_text()
 WRAPPER = (TIER / "agy-wrapper.sh").read_text()
 IMAGE_DIR = "IMAGE_DIR=/etc/antigravity\n"
+_HELPER_PATH = "/usr/local/lib/dockade/operator-instructions.sh"
+_OPERATOR_PATH = "/operator/AGENTS.md"
 
 _BASH = shutil.which("bash")
 _SH = shutil.which("sh")
@@ -52,8 +54,17 @@ class _Boot(unittest.TestCase):
         shutil.copy(TIER / "settings.json", self.etc / "settings.json")
         shutil.copy(TIER / "user-AGENTS.md", self.etc / "AGENTS.md.template")
         self.assertEqual(HOOK.count(IMAGE_DIR), 1, "the hook no longer names its image dir")
+        # The operator-instructions helper from the repo, where the image has it in
+        # /usr/local/lib, and the operator's file at a temp path for /operator.
+        self.operator = self.tmp / "operator" / "AGENTS.md"
+        self.operator.parent.mkdir()
+        hook = HOOK.replace(IMAGE_DIR, f"IMAGE_DIR={self.etc}\n")
+        for baked, here in ((_HELPER_PATH, str(ROOT / "sandbox-common" / "operator-instructions.sh")),
+                            (_OPERATOR_PATH, str(self.operator))):
+            self.assertEqual(hook.count(baked), 1, f"the hook no longer names {baked} once")
+            hook = hook.replace(baked, here)
         self.hook = self.tmp / "tier-setup.sh"
-        self.hook.write_text(HOOK.replace(IMAGE_DIR, f"IMAGE_DIR={self.etc}\n"))
+        self.hook.write_text(hook)
 
     def boot(self, **env_over: str) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if not k.startswith("TOOL_GATEWAY_")}
@@ -113,6 +124,20 @@ class HookTests(_Boot):
         self.assertEqual(rules.read_bytes(), (TIER / "user-AGENTS.md").read_bytes())
         self.assertEqual(stat.S_IMODE(rules.stat().st_mode), 0o644)
         self.assertEqual(stat.S_IMODE(rules.parent.stat().st_mode), 0o700)
+
+    def test_the_operators_instructions_follow_the_images_every_boot(self):
+        # Once per boot, onto the freshly installed template, never onto the last
+        # boot's file: the helper's own output is tests/test_operator_instructions.py's.
+        self.operator.write_text("- Answer in British English.\n")
+        rules = self.home / ".gemini" / "AGENTS.md"
+        baked = (TIER / "user-AGENTS.md").read_text()
+        for _ in range(2):
+            proc = self.boot()
+            self.assertNotIn("WARNING", proc.stderr)
+            text = rules.read_text()
+            self.assertTrue(text.startswith(baked), text[:200])
+            self.assertEqual(text.count("# The operator's own instructions"), 1)
+            self.assertTrue(text.endswith("\n\n- Answer in British English.\n"), text[-200:])
 
     def test_the_gateway_entry_is_written_only_when_a_gateway_was_found(self):
         proc = self.boot()

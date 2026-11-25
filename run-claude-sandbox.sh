@@ -18,6 +18,10 @@
 # are optional and neither needs network. See sandbox-lib.sh (sc_marketplaces,
 # sc_plugin_allowlist) and claude-sandbox/tier-setup.sh.
 #
+# ~/.config/dockade/claude/CLAUDE.md, when it exists, is mounted READ-ONLY at
+# /operator/CLAUDE.md and appended to the baked user-scope CLAUDE.md at boot
+# (sandbox-lib.sh, sc_operator_config; sandbox-common/operator-instructions.sh).
+#
 # --build-only builds the image and exits WITHOUT launching (no workspace mount,
 # no network) — a headless way to assert the image still builds (used by
 # `make check`); implies a rebuild.
@@ -108,6 +112,7 @@ sc_guard_workspace "$WORKSPACE"
 WORKSPACE="$SC_WORKSPACE"
 sc_workspace_mount "$WORKSPACE"
 sc_refs
+sc_operator_config claude "$WORKSPACE" CLAUDE.md
 
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG" ${SC_BUILD_ARGS[@]+"${SC_BUILD_ARGS[@]}"}
@@ -138,6 +143,7 @@ echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Claude)"
 echo "Image:     $IMAGE_NAME"
 echo "Workspace: $WORKSPACE -> $SC_WORKSPACE_MOUNT"
 echo "Refs:      $SC_REFS_DESC"
+[[ -z "$SC_CUSTOM_DESC" ]] || echo "Custom:    $SC_CUSTOM_DESC"
 echo "Markets:   $SC_MARKETPLACE_DESC"
 echo "Plugins:   $SC_PLUGINS_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
@@ -235,6 +241,7 @@ docker run "${RUN_MODE_ARGS[@]}" \
     -v "$CONFIG_VOLUME":/config \
     ${SC_MARKETPLACE_ARGS[@]+"${SC_MARKETPLACE_ARGS[@]}"} \
     ${SC_REFS_ARGS[@]+"${SC_REFS_ARGS[@]}"} \
+    ${SC_OPERATOR_ARGS[@]+"${SC_OPERATOR_ARGS[@]}"} \
     \
     -e "TERM=${TERM:-xterm-256color}" \
     -e "TZ=$SC_TZ" \

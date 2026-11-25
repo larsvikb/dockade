@@ -527,6 +527,21 @@ for ref in /refs/*/; do
     fi
 done
 [ "$refs" -gt 0 ] || info "/refs not mounted (SANDBOX_REFS unset)"
+# /operator/<file> are the operator's own files for this tier (sc_operator_config),
+# each mounted alone. Writable, the agent would edit the instructions every later
+# launch of its tier appends. Opened for append and closed with nothing written,
+# so a writable one is reported without being changed.
+operator_files=0
+for file in /operator/*; do
+    [ -f "$file" ] || continue
+    operator_files=$((operator_files + 1))
+    if ( : >> "$file" ) 2>/dev/null; then
+        bad "$file is WRITABLE — the operator's files must be read-only"
+    else
+        ok "$file is read-only"
+    fi
+done
+[ "$operator_files" -gt 0 ] || info "/operator not mounted (no operator files for this tier)"
 # The session's start directory. Every launcher sets -w to /workspace/<folder-name> in
 # every mode, for the reason in DESIGN.md, "The checkout mounts at
 # /workspace/<folder-name>". A lost -w falls back to the images' WORKDIR /workspace

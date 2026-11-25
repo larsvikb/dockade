@@ -13,6 +13,10 @@
 # SANDBOX_REFS, a comma-separated list of host directories, mounts each one
 # READ-ONLY at /refs/<name> as reference material (see sandbox-lib.sh, sc_refs).
 #
+# ~/.config/dockade/agy/AGENTS.md, when it exists, is mounted READ-ONLY at
+# /operator/AGENTS.md and appended to the baked ~/.gemini/AGENTS.md at boot
+# (sandbox-lib.sh, sc_operator_config; sandbox-common/operator-instructions.sh).
+#
 # The flags are run-claude-sandbox.sh's, and that file's comments say what each does
 # and why --boundary-check runs the check as the container's command.
 #
@@ -74,6 +78,7 @@ sc_guard_workspace "$WORKSPACE"
 WORKSPACE="$SC_WORKSPACE"
 sc_workspace_mount "$WORKSPACE"
 sc_refs
+sc_operator_config agy "$WORKSPACE" AGENTS.md
 
 if [[ "$REBUILD" == "true" ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     sc_build_image "$IMAGE_NAME" "$IMAGE_DIR" "$CACHE_FLAG"
@@ -97,6 +102,7 @@ echo "Sandbox:   $SC_CONTAINER_NAME (tier 1 — Antigravity)"
 echo "Image:     $IMAGE_NAME"
 echo "Workspace: $WORKSPACE -> $SC_WORKSPACE_MOUNT"
 echo "Refs:      $SC_REFS_DESC"
+[[ -z "$SC_CUSTOM_DESC" ]] || echo "Custom:    $SC_CUSTOM_DESC"
 echo "Git ident: ${SC_GIT_NAME:-<none>} <${SC_GIT_EMAIL:-none}>"
 echo "Egress:    $SC_EGRESS_DESC"
 # Nothing added when there is no gateway: agy has no strict MCP mode, so a workspace
@@ -140,6 +146,7 @@ docker run "${RUN_MODE_ARGS[@]}" \
     -w "$SC_WORKSPACE_MOUNT" \
     -v "$CONFIG_VOLUME":/config \
     ${SC_REFS_ARGS[@]+"${SC_REFS_ARGS[@]}"} \
+    ${SC_OPERATOR_ARGS[@]+"${SC_OPERATOR_ARGS[@]}"} \
     \
     -e "TERM=${TERM:-xterm-256color}" \
     -e "TZ=$SC_TZ" \

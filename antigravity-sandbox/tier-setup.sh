@@ -33,8 +33,9 @@ set -euo pipefail
 #     this boot's sandbox id, which siblings must never share. User-owned, unlike
 #     Claude's root-owned pointer, because agy takes no flag naming an MCP config
 #     file; it reads this path, and a workspace's .agents/mcp_config.json beside it.
-#   - the instructions, ~/.gemini/AGENTS.md, one of agy's user-level rule files.
-#     Per container, since they hold nothing a sibling differs in.
+#   - the instructions, ~/.gemini/AGENTS.md, one of agy's user-level rule files,
+#     with the operator's own appended when the launcher mounted any. Per
+#     container, since they hold nothing a sibling differs in.
 
 USERNAME=sandbox
 CONFIG_DIR="${SANDBOX_CONFIG_DIR:-/config}"
@@ -68,6 +69,13 @@ mv -f "$settings.tmp.$$" "$settings"
 
 install -d -m 0700 "$HOME/.gemini" "$HOME/.gemini/config"
 install -m 0644 "$IMAGE_DIR/AGENTS.md.template" "$HOME/.gemini/AGENTS.md"
+# Then the operator's own, from ~/.config/dockade/agy/AGENTS.md on the host, when the
+# launcher mounted one, under a heading after the baked text. Per container, like the
+# file it is appended to. /operator is nowhere agy looks for rules on its own, so it
+# loads once.
+# shellcheck source=sandbox-common/operator-instructions.sh
+source /usr/local/lib/dockade/operator-instructions.sh
+append_operator_instructions "/operator/AGENTS.md" "$HOME/.gemini/AGENTS.md"
 
 # ---------------------------------------------------------------------------
 # The MCP gateway  ->  ~/.gemini/config/mcp_config.json

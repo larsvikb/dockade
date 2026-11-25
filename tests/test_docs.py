@@ -862,5 +862,53 @@ class JdkVariantDocTests(unittest.TestCase):
                 self.assertEqual(set(re.findall(r"/opt/junit/\S+?\.jar", text)), {self.jar()})
 
 
+class TierFolderListTests(unittest.TestCase):
+    """The operator's per-tier folders in the config home, as the docs list them, are
+    exactly ``_SC_TIERS`` in ``sandbox-lib.sh``.
+
+    The list is written out where the operator and the maintainer look for it: the
+    README's config-home table, DESIGN.md's "Operator customization" and "Durable host
+    config", and the Makefile's comment on the config home. A tier added to the list
+    (the next one changes what the workspace guard walks) and to none of them leaves
+    an operator not knowing the folder exists, with nothing failing. Read by phrase,
+    ``folder per tier (...)`` and the README row for the operator's additions, so a
+    reworded spot fails as unfound rather than passing on nothing."""
+
+    #: A list after the phrase, comment markers and line breaks folded away.
+    PHRASE = re.compile(r"folder per tier[^(]*\(([^)]*)\)")
+
+    @staticmethod
+    def _flat(text: str) -> str:
+        return re.sub(r"[ \t]*\n[ \t]*(?:#[ \t]*)?", " ", text)
+
+    @staticmethod
+    def _names(spot: str) -> set[str]:
+        return set(re.findall(r"`(?:~/\.config/dockade/)?([a-z0-9-]+)/`", spot))
+
+    def tiers(self) -> set[str]:
+        found = re.findall(r"^_SC_TIERS=\((.*)\)$", (ROOT / "sandbox-lib.sh").read_text(), re.M)
+        self.assertEqual(len(found), 1, found)
+        return set(found[0].split())
+
+    def spots(self) -> list[tuple[str, str]]:
+        """(where, the text of its list), for every place the list is written."""
+        spots = []
+        for name, count in (("DESIGN.md", 2), ("Makefile", 1)):
+            found = self.PHRASE.findall(self._flat((ROOT / name).read_text()))
+            self.assertEqual(len(found), count, f"{name}: {found}")
+            spots += [(f"{name} #{i}", text) for i, text in enumerate(found)]
+        rows = [line.split("|")[1] for line in (ROOT / "README.md").read_text().splitlines()
+                if line.startswith("| `~/.config/dockade/") and "your own additions" in line]
+        self.assertEqual(len(rows), 1, rows)
+        return [*spots, ("README.md", rows[0])]
+
+    def test_every_list_names_exactly_the_tiers_the_launcher_knows(self):
+        tiers = self.tiers()
+        self.assertTrue(tiers)
+        for where, spot in self.spots():
+            with self.subTest(where=where):
+                self.assertEqual(self._names(spot), tiers, spot)
+
+
 if __name__ == "__main__":
     unittest.main()

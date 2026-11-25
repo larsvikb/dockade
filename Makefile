@@ -61,8 +61,9 @@ export DOCKADE_GID
 # Durable per-machine config lives here, OUTSIDE the repo, for the reason above:
 # this tree is bind-mounted read-write into a sandbox, so anything configured
 # from inside it is agent-writable. Holds `secrets/` (MCP credentials),
-# `marketplaces/` (plugin marketplace checkouts, mounted read-only) and `plugins`
-# (which plugin@marketplace ids to enable).
+# `marketplaces/` (plugin marketplace checkouts, mounted read-only), `plugins`
+# (which plugin@marketplace ids to enable) and a folder per tier (`claude/`,
+# `opencode/`, `agy/`) for the operator's own additions to it.
 #
 # Spelled here AND in sandbox-lib.sh's sc_config_home, because make cannot source
 # bash and the launchers cannot read a Makefile; `make consistency` asserts the
@@ -106,6 +107,7 @@ SCRIPTS := $(LAUNCHERS) \
            sandbox-common/init-firewall.sh \
            sandbox-common/entrypoint.sh \
            sandbox-common/boundary-check.sh \
+           sandbox-common/operator-instructions.sh \
            claude-sandbox/tier-setup.sh \
            opencode-sandbox/tier-setup.sh \
            antigravity-sandbox/tier-setup.sh \
@@ -487,6 +489,26 @@ consistency: ## Repo consistency guards (syntax, allowlist drift, file refs)
 	if [ "$$mounted" -eq 0 ]; then
 	  echo "  FAIL: nothing constructs a /refs mount, so this guard checked nothing."
 	  echo "        sc_refs does — did the mount change shape?"
+	  exit 1
+	fi
+	echo "== operator mounts are READ-ONLY =="
+	# The same again for the operator's own files (sc_operator_config). Writable,
+	# the agent edits the instructions every later launch of its tier appends.
+	mounted=0
+	for f in $(LAUNCHERS) sandbox-lib.sh; do
+	  tot=$$(grep -cE -- '-v "[^"]*":/operator/' "$$f" || true)
+	  [ "$$tot" -gt 0 ] || continue
+	  ro=$$(grep -cE -- '-v "[^"]*":/operator/[^ ]*:ro\)?$$' "$$f" || true)
+	  if [ "$$tot" != "$$ro" ]; then
+	    echo "  FAIL: $$f constructs $$tot /operator mount(s) but only $$ro carry :ro."
+	    exit 1
+	  fi
+	  mounted=$$((mounted + tot))
+	  echo "  ok $$f ($$tot mount(s), all :ro)"
+	done
+	if [ "$$mounted" -eq 0 ]; then
+	  echo "  FAIL: nothing constructs an /operator mount, so this guard checked nothing."
+	  echo "        sc_operator_config does — did the mount change shape?"
 	  exit 1
 	fi
 	echo "== every tracked source file carries an SPDX header =="
@@ -1433,10 +1455,11 @@ check-boundary: up ## Stand the infra up and assert containment from inside a th
 	# builds, so infra whose image or config changed since the last `up` is
 	# recreated under them. And the throwaway sandbox boots as any tier-1 launch
 	# does: its boot writes the config volume every running Claude sandbox shares
-	# (it reinstalls settings.json and the user CLAUDE.md) from its own image,
-	# which need not match a running session's (a newer build, or a JDK variant
-	# left unrebuilt), and a running session, or one started after, reads those
-	# writes. That boot touches running sessions as launching one more session
+	# (it reinstalls settings.json and the user CLAUDE.md from its own image, and
+	# appends the operator's CLAUDE.md when ~/.config/dockade/claude holds one),
+	# and its image need not match a running session's (a newer build, or a JDK
+	# variant left unrebuilt), and a running session, or one started after, reads
+	# those writes. That boot touches running sessions as launching one more session
 	# would. The boot's writes are made in sandbox-common/entrypoint.sh and
 	# claude-sandbox/tier-setup.sh.
 	#

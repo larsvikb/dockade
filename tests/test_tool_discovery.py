@@ -334,6 +334,22 @@ class PlacementTests(unittest.TestCase):
                     gateway = False
                 self.assertEqual(gateway, policy._endpoint_error(8082, path) is None)
 
+    def test_the_unsendable_character_rule_is_the_control_planes_own(self):
+        # As the path pattern above: registration refuses a template holding one of
+        # these, and the gateway refuses a stored row holding one, by the same rule.
+        # Every code point, because a sampled range would miss a divergence in a block
+        # nobody listed.
+        policy = load_control_plane().policy
+        mismatched = [
+            f"U+{cp:04X}" for cp in range(0x110000)
+            if self.discovery._unsendable_char(chr(cp)) != policy._unsendable_char(chr(cp))]
+        self.assertEqual(mismatched, [])
+        # Several characters, so the first one found and its position agree too.
+        for value in ("", "Bearer abc", "Bearer\tabc\x00", "ab\xa0\u2028", "é\x85"):
+            with self.subTest(value=value):
+                self.assertEqual(self.discovery._unsendable_char(value),
+                                 policy._unsendable_char(value))
+
     def test_a_long_path_is_refused_at_once(self):
         # The first spelling of the pattern backtracked exponentially: this path took it
         # seconds, a 128-char one would never return. Kept short so a regression FAILS
@@ -1183,6 +1199,47 @@ class AuthHeaderTests(unittest.TestCase):
         # credential" from "this server's credential is wrong".
         self.assertIn("Authorization", said)
 
+    def test_a_template_http_client_would_send_as_is_is_refused_quoting_nothing(self):
+        # http.client refuses only a bare CR or LF and non-latin-1, and sends these
+        # as they are: a row stored before the control plane refused them would
+        # reach the upstream as a malformed header and come back as an opaque error.
+        secret = "ghp_" + "S" * 36
+        for char in ("\x00", "\t", "\x7f", "\x85", "\xa0", "\xad"):
+            template = f"Bearer{char}{{secret}}"
+            with self.subTest(char=f"U+{ord(char):04X}"):
+                with self.assertRaises(self.discovery.DiscoveryError) as caught:
+                    self.discovery.auth_header(
+                        {"type": "header", "header": "Authorization",
+                         "template": template},
+                        secret, "/run/secrets/mcp-github.json")
+                said = str(caught.exception)
+                self.assertIn("'Authorization'", said)
+                self.assertIn("cannot be sent", said)
+                self.assertIn("/run/secrets/mcp-github.json", said)
+                self.assertNotIn(secret, said)
+                self.assertNotIn("Bearer", said)
+                self.assertNotIn(char, said)
+                # Neither the code point nor its position, as the control plane's
+                # registration message gives them: this message quotes nothing.
+                self.assertNotIn("U+", said)
+
+    def test_the_built_value_is_checked_not_only_the_template(self):
+        # read_secret holds a secret to printable ASCII, but this guards the value it
+        # sends, so a secret that reached it some other way is refused too.
+        with self.assertRaises(self.discovery.DiscoveryError) as caught:
+            self.discovery.auth_header(ENTRY["auth"], "abc\x00def")
+        self.assertIn("cannot be sent", str(caught.exception))
+        self.assertNotIn("abc", str(caught.exception))
+
+    def test_a_printable_latin1_template_still_builds_its_header(self):
+        for template in ("Bearer {secret}", "Clé {secret}"):
+            with self.subTest(template=template):
+                self.assertEqual(
+                    self.discovery.auth_header(
+                        {"type": "header", "header": "Authorization",
+                         "template": template}, "abc123"),
+                    {"Authorization": template.replace("{secret}", "abc123")})
+
 
 class SecretPathTests(unittest.TestCase):
 
@@ -1453,7 +1510,8 @@ class ReconcileTests(unittest.TestCase):
         import tempfile
         secret = "ghp_" + "S" * 36
         opened = []
-        for template in ("Bearer\n{secret}", "Bearer\r{secret}", "Bearer ✓{secret}"):
+        for template in ("Bearer\n{secret}", "Bearer\r{secret}", "Bearer ✓{secret}",
+                         "Bearer\x00{secret}", "Bearer\t{secret}"):
             with self.subTest(template=template), \
                     tempfile.TemporaryDirectory() as secrets:
                 with open(f"{secrets}/mcp-github.json", "w", encoding="utf-8") as handle:

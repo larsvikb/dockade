@@ -344,24 +344,32 @@ def auth_header(auth: dict, secret: str | None, where: str = "") -> dict[str, st
     name = auth.get("header") or "Authorization"
     template = auth.get("template") or "{secret}"
     value = template.replace("{secret}", secret)
-    # Refused here because http.client's own refusal quotes the whole value, secret
-    # included, and that message would reach the inventory, the audit and the agent.
-    # This one quotes neither the template nor the secret.
-    if "\r" in value or "\n" in value or not _latin1(value):
+    # Refused here for two reasons. A bare CR or LF, or a non-latin-1 character, makes
+    # http.client refuse, quoting the whole value, secret included, and that message
+    # would reach the inventory, the audit and the agent. NUL, tab, DEL and C1 it
+    # sends as they are, and a CR or LF before a space or tab as a folded line, so a
+    # row stored before registration refused them would reach the upstream as a
+    # malformed header and come back as an opaque error. This message quotes neither
+    # the template, the secret, nor the character.
+    if _unsendable_char(value) is not None:
         raise DiscoveryError(
             f"auth descriptor's template for {name!r} builds a header value that cannot "
-            f"be sent (a line break, or a character outside latin-1) for the "
-            f"credential at {where or SECRETS_DIR}")
+            f"be sent (a control character, or a character outside printable latin-1) "
+            f"for the credential at {where or SECRETS_DIR}")
     return {name: value}
 
 
-def _latin1(text: str) -> bool:
-    """Whether http.client can encode ``text`` as a header value."""
-    try:
-        text.encode("latin-1")
-    except UnicodeEncodeError:
-        return False
-    return True
+# The control plane's own rule, which refuses these at registration: its
+# ``policy._unsendable_char`` docstring gives the reasoning. Two images, no shared
+# module, so it is written once in each and held equal by
+# tests/test_tool_discovery.py, as ``_PATH_RE`` is.
+def _unsendable_char(value: str) -> tuple[int, str] | None:
+    """The first character of ``value`` that cannot be in a header value the gateway
+    sends, with its position counted from 1, or None."""
+    for i, ch in enumerate(value, 1):
+        if ch > "\u00ff" or not ch.isprintable():
+            return i, ch
+    return None
 
 
 #: An SSE line end: CRLF, CR or LF.
@@ -919,7 +927,8 @@ def reconcile_all(roster: list[dict]) -> list[dict]:
     that depends on the Python build. Never silent, since the exception's
     type is in the status every report prints and every push carries — and so is its
     message, which is why an input whose exception would quote a secret (a header
-    value http.client refuses) is refused before the dial instead (``auth_header``).
+    value http.client refuses) is refused before the dial instead, along with every
+    other value the control plane refuses at registration (``auth_header``).
 
     An entry of a shape ``entry_fault`` refuses reads NOT ENUMERATED too, with that
     reason and no dial. Both failures are named by ``entry_name``, so the guard's own

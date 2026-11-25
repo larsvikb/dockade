@@ -203,6 +203,17 @@ resuming. That matches `claude --help`, which describes `--fork-session` as "Whe
 resuming, create a new session ID instead of reusing the original". Not measured:
 `--continue` and the picker form of `--resume`.
 
+## Claude Code's Bash tool runs each command in a `bash -c` carrying its full text
+
+Measured on Claude Code 2.1.332 in the tier-1 sandbox, 2026-11-26: every Bash call runs
+as `/bin/bash -c source <shell snapshot> … && eval '<the command>'`, so the command's
+own text is in a live process's command line while it runs. `pgrep -af "<marker>"`
+for a marker no other process holds exits 0 and lists that shell. A wait that polls
+`pgrep -f` for a run's name therefore never sees the run end: a task 383 worker's
+`until … || ! pgrep -f "tasks.test.js"; do sleep 5; done` outlived its finished
+`make ui-test` by about 18 minutes. Bash's `run_in_background` notifies the agent when
+the command exits, a subagent included, so no poll is needed.
+
 ## An MCP server can be declared four ways, and `settings.json` is not one of them
 
 Measured in-container on Claude Code 2.1.234, because the channel that looks most

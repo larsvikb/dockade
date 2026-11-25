@@ -33,7 +33,10 @@ session's; they are not containment.
    is something you report, not widen or work around: re-scoping and sending the task
    back are the briefing session's.
 4. **Work** under `CLAUDE.md`'s conventions: testing what the container can, naming
-   roles, not people, and "Where writing goes".
+   roles, not people, and "Where writing goes". To wait for a long run, start it with
+   Bash's `run_in_background`, whose exit notifies you, rather than polling for it: Bash
+   runs each command in a `bash -c` carrying its full text, so `pgrep -f <pattern>`
+   always finds that shell, and a wait on it never sees the run end.
 5. **Before each commit and each amend,** check the two things reviews most often find
    left undone; on a fix's amend, what the fix touches:
    - **Text the change made false.** `git grep` the whole repo by the old behaviour's

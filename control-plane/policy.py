@@ -521,10 +521,10 @@ def _unsendable_char(value: str) -> tuple[int, str] | None:
     included though RFC 9110 allows it, DEL, C1), no NBSP or soft hyphen, which look
     like a space or nothing and earn a 401, and nothing above U+00FF, which also
     catches a lone surrogate. A bare CR or LF, or anything past latin-1, makes
-    ``http.client`` raise with the whole built value, secret included
-    (``discovery.auth_header`` in the tool gateway is the runtime guard); one before
-    a space or tab it sends as a folded line, and NUL it sends as is, so the store
-    is the one place those are caught before an upstream sees them."""
+    ``http.client`` raise with the whole built value, secret included, and NUL, tab,
+    DEL and C1 it sends as they are. ``discovery.auth_header`` in the tool gateway
+    refuses the same set at runtime, by a copy of this rule that
+    tests/test_tool_discovery.py holds equal to it."""
     for i, ch in enumerate(value, 1):
         if ch > "\u00ff" or not ch.isprintable():
             return i, ch

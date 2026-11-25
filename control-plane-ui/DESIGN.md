@@ -286,8 +286,11 @@ it, the title and tab badges, the saturation banner: its levels, its decay by th
 clock, and what Dismiss sends and shows when the acknowledgement is recorded, recorded
 short or refused; and each list's stale vs failed views, for the decisions, policy,
 live leases, tool rules and pins: a failed first read, a failed refresh that keeps its
-rows, and the good read that clears the warning. For tool rules the good read is tested
-only after a failed refresh, as with nothing loaded there is no revoke to trigger one.
+rows, and the good read that clears the warning; and the decisions' outage line and
+rows: the fail-closed denial's row marked in the folded view and in the record, and the
+line counting its requests, gone on a record page that has none. For tool rules the
+good read is tested only after a failed refresh, as with nothing loaded there is no
+revoke to trigger one.
 In `make test` `start()`'s DOM path has only the guards above and the free-name check
 below. Mutation testing is what showed the gap: every mutation in a pure helper was caught and every one inside `start()` survived.
 

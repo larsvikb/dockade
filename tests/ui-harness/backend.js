@@ -17,6 +17,14 @@ const CONFIG = {
 
 const AUDIT = {
   rows: [
+    // A denial the proxy made on its own because it could not reach the control plane,
+    // with the reason as _authorize in proxies/egress/addon.py writes it, so the page
+    // draws its outage row and the outage line above the table. Folded from five, so
+    // the line counts requests and not rows.
+    { id: 4, ts: NOW - 20, kind: "deny", host: "objects.example.net", port: 443,
+      client: "172.28.0.5", client_class: "agent",
+      reason: "control-plane unreachable, fail-closed (timed out)", n: 5,
+      first_ts: NOW - 120, fail_closed: true },
     { id: 3, ts: NOW - 30, kind: "allow", host: "pypi.org", port: 443,
       client: "172.28.0.5", client_class: "agent", reason: "rule .pypi.org", n: 4,
       first_ts: NOW - 600 },
@@ -184,9 +192,15 @@ export const STALE_HOLD = {
   } };
 
 // The record view, two pages of it: the first says there is an older one, and the
-// second, asked for with that cursor, says there is not.
+// second, asked for with that cursor, says there is not. Only the first carries a
+// fail-closed denial, so paging to the second shows the outage line going away: it
+// counts the rows served, not the store.
 const EVENTS = {
   rows: [
+    // One of the folded view's fail-closed denials, as the record serves it.
+    { id: 13, ts: NOW - 20, kind: "deny", host: "objects.example.net", port: 443,
+      client: "172.28.0.5", client_class: "agent",
+      reason: "control-plane unreachable, fail-closed (timed out)", fail_closed: true },
     { id: 12, ts: NOW - 40, kind: "deny", host: "plain.example", port: 80, proto: "http",
       stage: "http", method: "GET", url: "http://plain.example/setup.sh",
       client: "172.28.0.5", client_class: "agent", reason: "operator" },

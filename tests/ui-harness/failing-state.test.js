@@ -6,11 +6,13 @@
 // and "Reconnect"), the saturation banner (control-plane/DESIGN.md, "Dismissal is
 // server-side, and it is a high-water mark"), and what each list says when its read
 // fails before or after one succeeded, stale vs failed (control-plane-ui/DESIGN.md,
-// "Empty vs. stale, on both polled lists"). Every expected value is worked out by hand
-// from that spec, app.js's comments on lampState, backoffDelay and STREAM_SILENT_MS,
-// saturation.js's saturationState and ackCount with renderSaturation and the Dismiss
-// handler in app.js, status.js's sentences, and backend.js's fixture; none is copied
-// from a run.
+// "Empty vs. stale, on both polled lists"), and the decisions' outage line and rows,
+// for a proxy failing closed (DESIGN.md, "Telling an outage denial from a policy
+// denial"). Every expected value is worked out by hand from that spec, app.js's comments
+// on lampState, backoffDelay and STREAM_SILENT_MS, saturation.js's saturationState and
+// ackCount with renderSaturation and the Dismiss handler in app.js, status.js's
+// sentences, audit.js's outageSummary, renderGrouped, renderEvents and renderOutage, and
+// backend.js's fixture; none is copied from a run.
 //
 //   node failing-state.test.js <served dir>
 //
@@ -565,8 +567,8 @@ test("a fresh page given 4 rejections with 3 acknowledged reads 1", TIMEOUT, asy
 const DECISIONS = {
   name: "decisions", read: "GET /api/audit", view: "audit", status: "audit-empty",
   body: "audit",
-  // AUDIT's three rows, one each in the grouped view the page opens on.
-  rows: 3,
+  // AUDIT's four rows, one each in the grouped view the page opens on.
+  rows: 4,
   stale: "Could not refresh — these are the last events loaded successfully and may "
        + "be out of date.",
   cold: "Could not load recent events — the control plane may be unreachable.",
@@ -729,4 +731,68 @@ test("the pins whose read on opening Tools fails read stale and keep their rows,
   await show("tools");
   assert.deepEqual(answers(PINS.read), [200, 503, 200]);
   assert.deepEqual(await listState(page, PINS), { status: null, rows: PINS.rows });
+});
+
+// ── the outage line and rows ────────────────────────────────────────────────
+
+// A denial the proxy made because it could not reach the control plane, told apart
+// from a policy denial (DESIGN.md, "Telling an outage denial from a policy denial"): its
+// row carries the outage class (audit.js, renderGrouped and renderEvents) and the line
+// above the table says how many requests to how many hosts were refused that way
+// (outageSummary, through renderOutage). The rows are backend.js's fixture in the order
+// it serves them; each view's are read from its own table body, since the hidden one
+// keeps its rows. The sentences are written from outageSummary's spec.
+const OUTAGE = "because the proxy could not reach the control plane. That is an "
+             + "outage, not policy — governed egress fails closed, so ";
+
+// The outage line as a user sees it, null while hidden, and the class of each row in
+// `body`.
+async function outageState(page, body) {
+  const line = page.locator("#audit-outage");
+  return {
+    line: await line.isVisible()
+      ? { text: await line.textContent(),
+          warn: await line.evaluate(el => el.classList.contains("warn")) }
+      : null,
+    rows: await page.locator(`#${body} > tr`).evaluateAll(trs => trs.map(tr => tr.className)),
+  };
+}
+
+// AUDIT's rows: the fail-closed denial on objects.example.net folded from 5, the allow
+// on pypi.org, the operator's deny on evil.example and the tool ask whose fail_closed is
+// false. The 5 is the row's n, not the one row.
+test("the folded view marks only the fail-closed row and says its 5 requests to 1 host "
+     + "were an outage", TIMEOUT, async t => {
+  const { page, show } = await approvalPage(t);
+  await show("audit");
+  assert.deepEqual(await outageState(page, "audit"), {
+    line: { text: `5 requests to 1 host below were denied ${OUTAGE}they were refused `
+                + "without any rule being consulted.", warn: true },
+    rows: ["outage", "", "", ""],
+  });
+});
+
+// EVENTS' first page: the raw fail-closed denial on objects.example.net, the deny on
+// plain.example and the allow on pypi.org. EVENTS_OLDER's one row, the deny on
+// evil.example, is not fail-closed. The switch to the record waits a zero-delay timer
+// (filtersChanged), so the clock moves past it.
+test("the record view marks only the raw fail-closed event and says 1 request; the older "
+     + "page, with none, hides the line, and the newer brings both back", TIMEOUT,
+     async t => {
+  const { page, tick, act, show } = await approvalPage(t);
+  await show("audit");
+  const first = {
+    line: { text: `1 request to 1 host below was denied ${OUTAGE}it was refused `
+                + "without any rule being consulted.", warn: true },
+    rows: ["outage", "", ""],
+  };
+  await page.check("#audit-every");
+  await tick(1);
+  assert.deepEqual(await outageState(page, "audit-events"), first);
+
+  await act(() => page.click("#audit-older"));
+  assert.deepEqual(await outageState(page, "audit-events"), { line: null, rows: [""] });
+
+  await act(() => page.click("#audit-newer"));
+  assert.deepEqual(await outageState(page, "audit-events"), first);
 });

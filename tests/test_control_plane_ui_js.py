@@ -4312,7 +4312,8 @@ class AuditTableSourceTests(unittest.TestCase):
         self.assertIsNotNone(row, "the row template was restructured")
         # A fragment, not a string: `html` refuses a string inside a tag, so a plain
         # ' class="outage"' would fail the whole render on exactly the rows an outage
-        # makes, and no fixture draws one.
+        # makes. The browser tests draw that branch too (tests/ui-harness/
+        # failing-state.test.js, "the outage line and rows").
         self.assertRegex(
             row.group(1),
             r"""^\$\{a\.failClosed \? html` class="outage"` : ""\}$""",

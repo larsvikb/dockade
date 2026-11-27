@@ -873,6 +873,80 @@ sc_service_ip() {
         "$1" 2>/dev/null || true
 }
 
+# The two containers docker-compose.yml puts on both the sandbox network and mcp-net,
+# by the container_name it gives them, and mcp-net by its compose name. One place,
+# so the container sc_governed_egress grants the firewall /32 to and the one
+# sc_refuse_dual_homed exempts cannot be two; EGRESS_PROXY_NAME and
+# TOOL_GATEWAY_NAME override the first two for both functions.
+SC_EGRESS_PROXY_DEFAULT=egress-proxy
+SC_TOOL_GATEWAY_DEFAULT=tool-gateway
+SC_MCP_NET=mcp-net
+
+# sc_refuse_dual_homed <net>
+#
+# Refuse to launch while any container other than the egress proxy and the tool
+# gateway is on both <net> and mcp-net. One there sits beside the credential-holding
+# MCP servers yet is reachable from anything on the agent's network (a sibling
+# sandbox, any other container there): a route onto mcp-net. The sandbox's own
+# firewall grants only per-service /32s, so this is a second layer behind it, not
+# the only one. tests/test_topology.py holds the compose files to that; this asks Docker,
+# so it also sees another compose project's servers and a hand-run container.
+#
+# `-a`, so a stopped container that would rejoin both on its next start counts. The
+# filter only narrows; the exact split of each network list decides. No mcp-net
+# (standalone, or the stack never started) answers empty: nothing can bridge onto
+# a network that does not exist. A query that fails refuses too, since by now the
+# launcher has reached the daemon. Run it after sc_ensure_network, before any
+# discovery, so a refusal comes before a health wait and before `docker run`.
+sc_refuse_dual_homed() {
+    local net="$1"
+    local proxy_name="${EGRESS_PROXY_NAME:-$SC_EGRESS_PROXY_DEFAULT}"
+    local gateway_name="${TOOL_GATEWAY_NAME:-$SC_TOOL_GATEWAY_DEFAULT}"
+    local listing name networks entry on_net on_mcp offender
+    local entries=() offenders=()
+
+    if ! listing="$(docker ps -a --filter "network=$SC_MCP_NET" \
+            --format '{{.Names}} {{.Networks}}')"; then
+        echo "ERROR: could not list the containers on $SC_MCP_NET — not launching." >&2
+        echo "       The launch checks that nothing but $proxy_name and $gateway_name" >&2
+        echo "       sits on both $net and $SC_MCP_NET, and that check did not run." >&2
+        exit 1
+    fi
+
+    while read -r name networks; do
+        if [[ "$name" == "$proxy_name" || "$name" == "$gateway_name" ]]; then
+            continue
+        fi
+        on_net=false
+        on_mcp=false
+        IFS=, read -ra entries <<< "$networks"
+        for entry in ${entries[@]+"${entries[@]}"}; do
+            if [[ "$entry" == "$net" ]]; then on_net=true; fi
+            if [[ "$entry" == "$SC_MCP_NET" ]]; then on_mcp=true; fi
+        done
+        if [[ "$on_net" == "true" && "$on_mcp" == "true" ]]; then
+            offenders+=("$name ($networks)")
+        fi
+    done <<< "$listing"
+
+    if (( ${#offenders[@]} == 0 )); then
+        return 0
+    fi
+    echo "ERROR: on both $net and $SC_MCP_NET, which only $proxy_name and $gateway_name may be:" >&2
+    for offender in "${offenders[@]}"; do
+        echo "         $offender" >&2
+    done
+    echo "       A container there sits beside the credential-holding MCP servers yet is" >&2
+    echo "       reachable from anything on $net (a sibling sandbox, any other container" >&2
+    echo "       there): it is a route onto $SC_MCP_NET. The sandbox firewall's per-service" >&2
+    echo "       grants are the first layer against that; this check is the second." >&2
+    echo "       Disconnect it from $net, or remove it:" >&2
+    echo "         docker network disconnect $net <name>    docker rm -f <name>" >&2
+    echo "       If it is the egress proxy or the tool gateway under another name, set" >&2
+    echo "       EGRESS_PROXY_NAME or TOOL_GATEWAY_NAME to it." >&2
+    exit 1
+}
+
 # ---------------------------------------------------------------------------
 # Service readiness
 # ---------------------------------------------------------------------------
@@ -984,7 +1058,7 @@ sc_wait_healthy() {
 sc_governed_egress() {
     local net="$1"
     shift
-    local proxy_name="${EGRESS_PROXY_NAME:-egress-proxy}"
+    local proxy_name="${EGRESS_PROXY_NAME:-$SC_EGRESS_PROXY_DEFAULT}"
     local proxy_port="${EGRESS_PROXY_PORT:-8080}"
     local proxy_ip gateway_name gateway_port gateway_ip proxy_url no_proxy_list
     local label='[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?' model_host model_hosts=""
@@ -1019,7 +1093,7 @@ sc_governed_egress() {
         # has to be resolved before the container starts. Handing that one resolution to
         # both the grant and the client config is what keeps them naming one address
         # rather than two that agree by luck.
-        gateway_name="${TOOL_GATEWAY_NAME:-tool-gateway}"
+        gateway_name="${TOOL_GATEWAY_NAME:-$SC_TOOL_GATEWAY_DEFAULT}"
         gateway_port="${TOOL_GATEWAY_PORT:-8100}"
         gateway_ip="$(sc_service_ip "$gateway_name" "$net")"
 

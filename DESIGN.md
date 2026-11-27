@@ -1581,6 +1581,20 @@ unreachable — probing the proxy's address there rather than a server's, becaus
 server runs unless its profile is enabled and "nothing listening" would pass for the
 wrong reason.
 
+Those tests read only the two compose files, so **an MCP server outside the curated
+baseline (`mcp-servers.yml`) needs a runtime gate**: one from another compose project,
+or a hand-run `docker run`, is asserted about by nothing else. The launchers' gate is
+`sc_refuse_dual_homed` in `sandbox-lib.sh`: at each launch it asks Docker for every
+container on `mcp-net`, stopped ones included, and refuses while any but the egress
+proxy and the tool gateway also has a `sandbox-net` leg: such a container sits beside
+the credential holders yet is reachable from anything on the agent's network, a sibling
+sandbox or any other container there, so it is a route onto `mcp-net`. The sandbox's
+firewall, which grants only per-service /32s, is the first layer against that; the
+gate is a second behind it. It does not cover a server's address on `mcp-net`, its
+name, anything placed after the launch, or a container on `sandbox-net` alone: with no
+`mcp-net` leg it is no route onto the credential holders, and the gateway will not dial
+it (`tool-gateway/discovery.py` dials only addresses on `mcp-net`).
+
 **The gateway is `tool-gateway`, and it is placed before it speaks.** The service
 is **triple-homed** — `sandbox-net`, `mcp-net`, `tool-authorize-net` — and the
 asymmetry between the three legs is the design rather than an implementation
@@ -2742,6 +2756,7 @@ is the copy that is dated and cannot drift. What is kept here is the resulting i
 | — | timed grants (`leases`) — `allow_lease`, the live-lease strip, revoke | **done** — exact host only; no breadth ladder |
 | — | the gateway's bridge — `tool-authorize-net`, third listener, decide/roster/inventory/claim | **done** |
 | — | `tool-gateway` placement — triple-homed, agent leg only, bind guard | **done** |
+| — | launch gate — nothing but the egress proxy and the tool gateway on both `sandbox-net` and `mcp-net` | **done** — checked at launch only |
 | — | gateway discovery — roster pull, `tools/list`, policy-vs-server report | **done** — reports to the log; writes no rule |
 | — | MCP client credentials — read-only mount, path derived from the server name | **done** — the gateway holds the directory; the task registry, its own file alone |
 | — | MCP server registration — UI tab: register, enable/disable, revoke | **done** |

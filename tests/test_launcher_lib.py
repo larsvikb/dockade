@@ -26,6 +26,11 @@ the bridge would be the worse bug.
 gateway is even looked up depends on whether a proxy answers on the network, so only
 running it in each host state shows that standalone mode never inspects the gateway.
 
+``sc_refuse_dual_homed`` earns it because what it refuses is the host's state too:
+which containers sit on both the sandbox network and mcp-net. ``DualHomedTests`` runs
+it alone; ``LauncherDualHomedTests`` runs every launcher through to ``docker run`` on a
+clean stack, and to the refusal, with nothing run, with an offender.
+
 ``LauncherProxyEnvTests`` runs ``run-claude-sandbox.sh`` through to ``docker run``,
 with every ``docker`` call answered by the stub, to show the function's output
 reaches the container and its Tools line says what Claude's tool surface is.
@@ -51,6 +56,7 @@ from pathlib import Path
 from typing import ClassVar, NamedTuple
 
 from test_launcher_run_flags import launchers
+from test_topology import _top
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "sandbox-lib.sh"
@@ -182,10 +188,12 @@ class EnsureNetworkTests(unittest.TestCase):
 
 # Answers what sc_governed_egress asks, for the one network named STUB_NET and no
 # other: a container's address on it (from STUB_IP_<name>, `-` mapped to `_`; unset
-# means not on it), its health, and the network's Internal flag. Everything else
-# (`image inspect`, `ps`, `run`) succeeds silently, which is what a whole launch needs;
-# `run` also writes its argv one per line to STUB_RUN_ARGV when that is set. Logs like
-# _DOCKER_STUB, and not `set -u` for its reason.
+# means not on it), its health, and the network's Internal flag. A `ps` filtered to
+# mcp-net answers STUB_PS_MCP, the containers on it as `name net,net` lines, or fails
+# when STUB_PS_FAIL is set. Everything else (`image inspect`, any other `ps`, `run`)
+# succeeds silently, which is what a whole launch needs; `run` also writes its argv one
+# per line to STUB_RUN_ARGV when that is set. Logs like _DOCKER_STUB, and not `set -u`
+# for its reason.
 _EGRESS_STUB = r"""#!/bin/bash
 printf '%s\n' "$*" >> "$STUB_LOG"
 if [ "$1 $2" = "network inspect" ]; then
@@ -208,6 +216,15 @@ if [ "$1" = "inspect" ]; then
             ;;
         *Health*) printf 'healthy\n' ;;
     esac
+fi
+if [ "$1" = "ps" ]; then
+    for arg in "$@"; do
+        if [ "$arg" = "network=mcp-net" ]; then
+            [ -z "$STUB_PS_FAIL" ] || exit 1
+            printf '%s' "$STUB_PS_MCP"
+            exit 0
+        fi
+    done
 fi
 if [ "$1" = "run" ] && [ -n "$STUB_RUN_ARGV" ]; then
     printf '%s\n' "$@" > "$STUB_RUN_ARGV"
@@ -410,6 +427,156 @@ class GovernedEgressTests(unittest.TestCase):
         self.assertEqual(env["TOOL_GATEWAY_PORT"], "9100")
         self.assertFalse(run.inspected("egress-proxy"))
         self.assertFalse(run.inspected("tool-gateway"))
+
+
+_GATE_HARNESS = 'set -euo pipefail; source "$1"; sc_refuse_dual_homed "$2"'
+
+
+def _dual_homed(listing: str, *, overrides: dict[str, str] | None = None,
+                fail: bool = False) -> _EgressRun:
+    """Run ``sc_refuse_dual_homed`` on _NET with Docker answering ``listing``, as
+    ``name net,net`` lines, for the containers on mcp-net."""
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = Path(tmp) / "docker"
+        stub.write_text(_EGRESS_STUB)
+        stub.chmod(0o755)
+        log = Path(tmp) / "calls.log"
+        log.touch()
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("EGRESS_PROXY_", "TOOL_GATEWAY_", "STUB_"))}
+        env.update(PATH=f"{tmp}{os.pathsep}{env['PATH']}", STUB_LOG=str(log),
+                   STUB_NET=_NET, STUB_PS_MCP=listing)
+        if fail:
+            env["STUB_PS_FAIL"] = "1"
+        env.update(overrides or {})
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, "-c", _GATE_HARNESS, "sc_refuse_dual_homed", str(LIB), _NET],
+            capture_output=True, text=True, env=env, timeout=60)
+        return _EgressRun(proc.returncode, proc.stdout, proc.stderr,
+                          log.read_text().splitlines())
+
+
+#: What `docker ps` answers for mcp-net on a clean stack: the two services compose puts
+#: on both networks, a catalogue server and the task registry on mcp-net alone.
+_CLEAN = (f"egress-proxy authorize-net,egress-net,mcp-net,{_NET}\n"
+          f"tool-gateway {_NET},mcp-net,tool-authorize-net\n"
+          "mcp-github mcp-net\n"
+          "tasks mcp-net,tasks-operator-net\n")
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class DualHomedTests(unittest.TestCase):
+    """The launch gate on a container on both the sandbox network and mcp-net."""
+
+    def assert_refused(self, run: _EgressRun, *offenders: str) -> None:
+        self.assertEqual(run.status, 1, run.stderr)
+        self.assertIn(f"on both {_NET} and mcp-net", run.stderr)
+        for offender in offenders:
+            self.assertIn(f"\n         {offender}\n", run.stderr)
+
+    def test_a_clean_stack_passes_and_is_asked_about_once_with_stopped_containers(self):
+        # An LLM on the sandbox network alone would not come back from the filter;
+        # one that did is still not on both.
+        run = _dual_homed(_CLEAN + f"llm-intel {_NET}\n")
+        self.assertEqual(run.status, 0, run.stderr)
+        self.assertEqual(run.stderr, "")
+        self.assertEqual(run.docker_calls, [
+            "ps -a --filter network=mcp-net --format {{.Names}} {{.Networks}}"])
+
+    def test_no_mcp_net_passes(self):
+        # Standalone, or the stack never started: Docker answers nothing.
+        self.assertEqual(_dual_homed("").status, 0)
+
+    def test_each_offender_is_refused_by_name_with_its_networks(self):
+        for line in (f"acme-mcp {_NET},mcp-net",                  # a hand-run server
+                     f"claude-sandbox-2 mcp-net,{_NET}",          # a sandbox connected on
+                     f"tool-gateway-2 {_NET},mcp-net",            # a near-miss name
+                     f"egress-proxy-old mcp-net,{_NET}",
+                     # a `docker compose run` one-off of the gateway
+                     f"dockade-tool-gateway-run-0a1b2c3d {_NET},mcp-net,tool-authorize-net"):
+            with self.subTest(line=line):
+                name, nets = line.split(" ")
+                self.assert_refused(_dual_homed(_CLEAN + line + "\n"), f"{name} ({nets})")
+
+    def test_every_offender_is_named(self):
+        run = _dual_homed(f"acme-a {_NET},mcp-net\n" + _CLEAN + f"acme-b mcp-net,{_NET}\n")
+        self.assert_refused(run, f"acme-a ({_NET},mcp-net)", f"acme-b (mcp-net,{_NET})")
+
+    def test_the_refusal_says_why_and_how_to_fix_it(self):
+        run = _dual_homed(f"acme-mcp {_NET},mcp-net\n")
+        for text in (f"reachable from anything on {_NET}", "a route onto mcp-net",
+                     f"docker network disconnect {_NET} <name>",
+                     "EGRESS_PROXY_NAME or TOOL_GATEWAY_NAME"):
+            with self.subTest(text=text):
+                self.assertIn(text, run.stderr)
+
+    def test_an_override_exempts_its_name_and_no_longer_the_default(self):
+        for var, default in (("TOOL_GATEWAY_NAME", "tool-gateway"),
+                             ("EGRESS_PROXY_NAME", "egress-proxy")):
+            with self.subTest(variable=var):
+                run = _dual_homed(_CLEAN + f"acme {_NET},mcp-net\n",
+                                  overrides={var: "acme"})
+                nets = next(ln.split(" ")[1] for ln in _CLEAN.splitlines()
+                            if ln.startswith(default + " "))
+                self.assert_refused(run, f"{default} ({nets})")
+                self.assertNotIn("acme (", run.stderr)
+
+    def test_the_networks_match_exactly(self):
+        for line in (f"acme mcp-net-old,{_NET}", f"acme mcp-net,{_NET}-old",
+                     f"acme mcp-net,old-{_NET}", "acme mcp-net"):
+            with self.subTest(line=line):
+                run = _dual_homed(_CLEAN + line + "\n")
+                self.assertEqual(run.status, 0, run.stderr)
+
+    def test_the_network_asked_about_is_the_argument(self):
+        run = _dual_homed(_CLEAN + "acme sandbox-net,mcp-net\n")
+        self.assertEqual(run.status, 0, run.stderr)
+
+    def test_a_query_that_fails_refuses(self):
+        run = _dual_homed(_CLEAN, fail=True)
+        self.assertEqual(run.status, 1)
+        self.assertIn("could not list the containers on mcp-net", run.stderr)
+
+    def test_the_lib_names_mcp_net_as_compose_does(self):
+        names = re.findall(r"^SC_MCP_NET=(\S+)$", LIB.read_text(), re.M)
+        self.assertEqual(names, [_top("networks")["mcp-net"]["name"]])
+
+
+@unittest.skipUnless(_BASH or _STRICT, "bash is not installed")
+class LauncherDualHomedTests(unittest.TestCase):
+    """Each launcher stops at the gate: DualHomedTests show what it refuses, this that
+    every tier asks it before anything is started."""
+
+    def test_each_launcher_refuses_an_offender_before_docker_run(self):
+        for path in launchers(ROOT):
+            with self.subTest(launcher=path.name):
+                proc, argv = _launch(
+                    path.name, ips={"egress-proxy": _PROXY, "tool-gateway": _GATEWAY,
+                                    "llm": "172.30.0.10"},
+                    internal=True,
+                    env_over={"STUB_PS_MCP": "acme-mcp sandbox-net,mcp-net\n"})
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertIn("\n         acme-mcp (sandbox-net,mcp-net)\n", proc.stderr)
+                self.assertIsNone(argv)
+
+    def test_claudes_standalone_launch_refuses_an_offender_too(self):
+        # Standalone, no proxy on a plain bridge: the gate is not a governed-mode step.
+        proc, argv = _launch("run-claude-sandbox.sh", ips={}, internal=False,
+                             env_over={"STUB_PS_MCP": "acme-mcp sandbox-net,mcp-net\n"})
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("\n         acme-mcp (sandbox-net,mcp-net)\n", proc.stderr)
+        self.assertIsNone(argv)
+
+    def test_each_launcher_launches_on_a_clean_stack(self):
+        clean = _CLEAN.replace(_NET, "sandbox-net")
+        for path in launchers(ROOT):
+            with self.subTest(launcher=path.name):
+                proc, argv = _launch(
+                    path.name, ips={"egress-proxy": _PROXY, "tool-gateway": _GATEWAY,
+                                    "llm": "172.30.0.10"},
+                    internal=True, env_over={"STUB_PS_MCP": clean})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIsNotNone(argv, "the launcher never reached docker run")
 
 
 def _launch(launcher: str, *, ips: dict[str, str], internal: bool,

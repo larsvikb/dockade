@@ -6,7 +6,9 @@ this is where they are held together:
 
   init-firewall.sh       grants the route, governed mode only
   sandbox-lib.sh         discovers the gateway, exempts it from the proxy, passes it on
-                         (sc_governed_egress, which run-claude-sandbox.sh calls)
+                         (sc_governed_egress, which the governed launchers call), and
+                         lets it alone sit on mcp-net too, with the egress proxy
+                         (sc_refuse_dual_homed, which every launcher calls)
   tier-setup.sh          writes the file the wrapper points `--mcp-config` at
   claude-wrapper.sh      puts the flags on every invocation
 
@@ -33,7 +35,7 @@ from typing import ClassVar
 
 from _loader import load_protocol, load_tool_gateway
 from test_launcher_run_flags import launchers
-from test_topology import _environment_of
+from test_topology import _environment_of, _raw_networks, _service, _service_names, _top
 
 ROOT = Path(__file__).resolve().parents[1]
 FIREWALL = (ROOT / "sandbox-common" / "init-firewall.sh").read_text()
@@ -42,6 +44,14 @@ LIB = (ROOT / "sandbox-lib.sh").read_text()
 TIER_SETUP = (ROOT / "claude-sandbox" / "tier-setup.sh").read_text()
 WRAPPER = (ROOT / "claude-sandbox" / "claude-wrapper.sh").read_text()
 DOCKERFILE = (ROOT / "claude-sandbox" / "Dockerfile").read_text()
+
+
+def _function_body(text: str, name: str) -> str:
+    """A shell function's text, from ``name() {`` to the ``}`` that closes it."""
+    match = re.search(rf"^{name}\(\) {{\n.*?^}}$", text, re.M | re.S)
+    if match is None:
+        raise AssertionError(f"no function {name}")
+    return match.group(0)
 
 
 class FirewallGrantTests(unittest.TestCase):
@@ -105,10 +115,42 @@ class LauncherTests(unittest.TestCase):
         deployed = _environment_of("tool-gateway")["GATEWAY_AGENT_PORT"].strip("\"'")
         self.assertIn(f'gateway_port="${{TOOL_GATEWAY_PORT:-{deployed}}}"', LIB)
 
-    def test_the_default_name_is_the_container_compose_runs(self):
-        self.assertIn('gateway_name="${TOOL_GATEWAY_NAME:-tool-gateway}"', LIB)
-        self.assertIn("container_name: tool-gateway",
-                      (ROOT / "docker-compose.yml").read_text())
+    def test_the_default_names_are_the_containers_compose_puts_on_both_networks(self):
+        # One pair of defaults, read by both the discovery that grants the firewall /32
+        # and the gate that exempts a container on both networks, so the two cannot
+        # name different containers; and that pair is exactly what compose dual-homes.
+        defaults = dict(re.findall(r"^SC_(EGRESS_PROXY|TOOL_GATEWAY)_DEFAULT=(\S+)$",
+                                   LIB, re.M))
+        self.assertEqual(sorted(defaults), ["EGRESS_PROXY", "TOOL_GATEWAY"])
+        reads = {var: f'"${{{var}_NAME:-$SC_{var}_DEFAULT}}"' for var in defaults}
+        for function in ("sc_governed_egress", "sc_refuse_dual_homed"):
+            body = _function_body(LIB, function)
+            for var, read in reads.items():
+                with self.subTest(function=function, variable=var):
+                    self.assertIn(read, body)
+        # No other default for either name anywhere in the library.
+        self.assertEqual(len(re.findall(r"(?:EGRESS_PROXY|TOOL_GATEWAY)_NAME:-", LIB)), 4)
+        networks = {key: body.get("name", key) for key, body in _top("networks").items()}
+        both = {"sandbox-net", "mcp-net"}
+        dual_homed = {_service(svc).get("container_name", svc) for svc in _service_names()
+                      if both <= {networks[n] for n in _raw_networks(svc)}}
+        self.assertEqual(dual_homed, set(defaults.values()))
+
+    def test_each_launcher_checks_for_dual_homed_containers_before_any_discovery(self):
+        # The gate refuses before anything is waited on or started: right after the
+        # network is settled, ahead of the egress discovery and any service lookup.
+        call = 'sc_refuse_dual_homed "$SANDBOX_NET"\n'
+        for path in launchers(ROOT):
+            text = path.read_text()
+            with self.subTest(launcher=path.name):
+                self.assertEqual(text.count("sc_refuse_dual_homed"), 1)
+                ensure = text.index('sc_ensure_network "$SANDBOX_NET" ')
+                gate = text.index(call)
+                self.assertLess(ensure, gate)
+                after = [text.index(step, ensure) for step in
+                         ("sc_governed_egress ", "sc_service_ip ", "sc_wait_healthy ",
+                          "\ndocker run ") if step in text[ensure:]]
+                self.assertLess(gate, min(after))
 
     def test_a_missing_gateway_is_reported_rather_than_fatal(self):
         # The sandbox still launches: `--strict-mcp-config` goes on unconditionally, so

@@ -295,7 +295,7 @@ image is where **enablement** lives:
 - baseline Claude Code settings and **hooks as quality gates**
   (e.g. format/test on write, block known-bad patterns) — *hooks: planned, not
   yet in the image (see Status)*
-- a default **status line** (`claude-sandbox/statusline.sh`, seeded into user
+- a default **status line** (`sandbox-common/statusline.sh`, seeded into user
   settings by Claude's setup hook the entrypoint runs — see below)
 - the **skills** that are the sanctioned interface to every capability, doing
   double duty: the capability interface **and** the right *way* to do a task,
@@ -336,7 +336,7 @@ containment is capability + egress, not file bits or any settings scope.
 
 The default **status line** ships this way. It shows a sandbox indicator,
 directory, git branch, the session id's first eight characters (why, in
-`claude-sandbox/statusline.sh`), **used context window** (tokens + %), and 5h/7d
+`sandbox-common/statusline.sh`), **used context window** (tokens + %), and 5h/7d
 subscription rate-limit usage with reset countdowns. The **script
 itself stays root-owned and baked** at `/etc/claude-code/statusline.sh`, so the
 non-root agent can toggle the pointer but not tamper with the code it runs — an
@@ -345,6 +345,11 @@ settings) is *required*, not just pragmatic: a managed-scope command status line
 is gated behind an interactive approval dialog the yolo launch flow suppresses,
 so it would never apply. User scope needs only workspace trust, which Claude Code
 records per path, so each `/workspace/<folder-name>` is trusted on its own.
+agy's tier bakes the same script at `/etc/antigravity/statusline.sh`, root-owned
+for the same reason, with the pointer in its `settings.json`. For agy the id shown
+is the launch's `$DOCKADE_SESSION_ID`, which wins over any id in the payload because
+it is the one agy's claims are made under. agy sends no rate limits, before or
+after a turn (NOTES.md), so the rate-limit segments do not show.
 
 The **yolo disclaimer acceptance ships this way too** —
 `skipDangerousModePermissionPrompt: true` in the template. This is a consequence of

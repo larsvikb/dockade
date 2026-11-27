@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""agy's boot hook and its wrapper, run.
+"""agy's boot hook, its wrapper and its status line, run.
 
 ``antigravity-sandbox/tier-setup.sh`` needs no root: as root it only re-execs as the
 sandbox user, so its whole effect is the user phase, which runs here as the test's own
 user with HOME and the config volume in a temp dir and the image's /etc/antigravity
 pointed at a copy of the repo's templates. ``agy-wrapper.sh`` runs with its real binary
-replaced by a stub that prints what it was given. The text both are wired by, in the
-Dockerfile, is held in tests/test_sandbox_wiring.py.
+replaced by a stub that prints what it was given. ``sandbox-common/statusline.sh``,
+which agy shares with Claude's tier, runs on the JSON a CLI hands it. The text all
+three are wired by, in the Dockerfile, is held in tests/test_sandbox_wiring.py.
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ _OPERATOR_PATH = "/operator/AGENTS.md"
 _BASH = shutil.which("bash")
 _SH = shutil.which("sh")
 _JQ = shutil.which("jq")
+_GIT = shutil.which("git")
 # Missing tools SKIP on a dev machine and FAIL under DOCKADE_REQUIRE_TOOLS, which CI
 # sets — as in tests/test_launcher_lib.py.
 _STRICT = bool(os.environ.get("DOCKADE_REQUIRE_TOOLS"))
@@ -118,6 +120,7 @@ class HookTests(_Boot):
         rules.write_text("edited in a session")
         self.boot()
         self.assertEqual(settings.read_bytes(), (TIER / "settings.json").read_bytes())
+        self.assertIn("statusLine", json.loads(settings.read_text()))
         self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
         self.assertEqual(sorted(p.name for p in settings.parent.iterdir()),
                          ["settings.json"])
@@ -191,8 +194,15 @@ class SettingsTests(unittest.TestCase):
 
     def test_the_only_rule_is_the_refs_read_allow(self):
         self.assertEqual(self.SETTINGS["permissions"], {"allow": ["read_file(/refs)"]})
+
+    def test_the_status_line_is_the_baked_script(self):
+        # Where the Dockerfile bakes it is held in tests/test_sandbox_wiring.py.
+        self.assertEqual(self.SETTINGS["statusLine"],
+                         {"type": "command", "command": "/etc/antigravity/statusline.sh"})
+
+    def test_no_other_key_is_set(self):
         self.assertEqual(set(self.SETTINGS),
-                         {"enableTerminalSandbox", "agentMode", "permissions"})
+                         {"enableTerminalSandbox", "agentMode", "permissions", "statusLine"})
 
 
 @unittest.skipUnless(_SH or _STRICT, "sh is not installed")
@@ -260,6 +270,140 @@ class WrapperTests(unittest.TestCase):
         bashrc = (TIER / "dotfiles" / ".bashrc.tier").read_text()
         aliases = re.findall(r"^alias ([\w-]+)='([^']*)'$", bashrc, re.M)
         self.assertEqual(aliases, [("agy-yolo", "agy --dangerously-skip-permissions")])
+
+
+@unittest.skipUnless((_BASH and _JQ and _GIT) or _STRICT, "bash, jq or git is not installed")
+class StatusLineTests(unittest.TestCase):
+    """The shared status line, on the payload agy was measured sending before its first
+    turn and after one (NOTES.md, "agy 1.5.17's status line, before and after a turn"),
+    and on Claude Code's."""
+
+    SCRIPT = ROOT / "sandbox-common" / "statusline.sh"
+    _SGR = re.compile(r"\x1b\[\d+m")
+    LAUNCH_ID = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.plain = Path(tmp.name) / "widgets"
+        self.plain.mkdir()
+
+    def line(self, payload: dict, launch_id: str | None = None) -> str:
+        """What the script prints, with its own colours taken out."""
+        env = {k: v for k, v in os.environ.items() if k != "DOCKADE_SESSION_ID"}
+        if launch_id is not None:
+            env["DOCKADE_SESSION_ID"] = launch_id
+        proc = subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_BASH, str(self.SCRIPT)], input=json.dumps(payload), capture_output=True,
+            text=True, env=env, timeout=60)
+        self.assertEqual((proc.returncode, proc.stderr), (0, ""))
+        return self._SGR.sub("", proc.stdout)
+
+    def agy(self, **over) -> dict:
+        """agy 1.5.17's payload before the first turn, as measured, with the cwd."""
+        return {"session_id": "", "cwd": str(self.plain),
+                "workspace": {"current_dir": str(self.plain)},
+                "context_window": {"total_input_tokens": 0, "context_window_size": 0,
+                                   "current_usage": None}, **over}
+
+    def claude(self, **over) -> dict:
+        return {"session_id": "abcdef0123456789", "cwd": str(self.plain),
+                "workspace": {"current_dir": str(self.plain)},
+                "context_window": {"total_input_tokens": 142000,
+                                   "context_window_size": 1000000,
+                                   "current_usage": {"input_tokens": 142000}},
+                "rate_limits": {"five_hour": {"used_percentage": 30.5},
+                                "seven_day": {"used_percentage": 60}}, **over}
+
+    def test_agys_payload_shows_the_launchs_id_and_nothing_it_lacks(self):
+        self.assertEqual(self.line(self.agy(), self.LAUNCH_ID),
+                         "🔒 sandbox · widgets · id 0f1e2d3c")
+
+    def test_agys_payload_after_a_turn_shows_the_launchs_id_and_agys_context(self):
+        # The figures as measured; the conversation id invented. quota is unread.
+        payload = self.agy(
+            session_id="cd8a5f9c-1111-2222-3333-444455556666",
+            context_window={"total_input_tokens": 26741, "total_output_tokens": 2427,
+                            "context_window_size": 1048576, "used_percentage": 2.55,
+                            "current_usage": {"input_tokens": 4968, "output_tokens": 1524,
+                                              "cache_creation_input_tokens": 0,
+                                              "cache_read_input_tokens": 16853}},
+            quota={"3p-5h": {"remaining_fraction": 0.9, "reset_in_seconds": 600}})
+        self.assertEqual(self.line(payload, self.LAUNCH_ID),
+                         "🔒 sandbox · widgets · id 0f1e2d3c · ctx 26k/1M 2%")
+
+    def test_claudes_payload_shows_its_own_id_context_and_limits(self):
+        self.assertEqual(
+            self.line(self.claude()),
+            "🔒 sandbox · widgets · id abcdef01 · ctx 142k/1M 14% · 5h 30% · 7d 60%")
+
+    def test_the_launchs_id_wins_and_the_payloads_stands_in_without_one(self):
+        # The launch's is the id agy's claims are made under; a payload id agy may
+        # send after its first turn is its own conversation's, which is not.
+        no_id = self.agy()
+        del no_id["session_id"]
+        for name, payload, launch_id, shown in (
+                ("empty, no launch id", self.agy(), None, None),
+                ("absent, a launch id", no_id, self.LAUNCH_ID, "0f1e2d3c"),
+                ("null, a launch id", self.agy(session_id=None), self.LAUNCH_ID, "0f1e2d3c"),
+                ("its own, a launch id", self.agy(session_id="abcdef0123"), self.LAUNCH_ID,
+                 "0f1e2d3c"),
+                ("its own, no launch id", self.agy(session_id="abcdef0123"), None,
+                 "abcdef01"),
+                ("its own, an empty launch id", self.agy(session_id="abcdef0123"), "",
+                 "abcdef01")):
+            with self.subTest(case=name):
+                text = self.line(payload, launch_id)
+                if shown is None:
+                    self.assertEqual(text, "🔒 sandbox · widgets")
+                else:
+                    self.assertEqual(text, f"🔒 sandbox · widgets · id {shown}")
+
+    def test_an_id_keeps_only_the_characters_an_agent_id_may_hold(self):
+        bad = "a\x1b]0;b\x07c/d e-_f.g"
+        for name, payload, launch_id in (("its own", self.agy(session_id=bad), None),
+                                         ("the launch's", self.agy(), bad)):
+            with self.subTest(id=name):
+                self.assertEqual(self.line(payload, launch_id),
+                                 "🔒 sandbox · widgets · id a0bcde-_")
+
+    def test_no_control_character_in_the_directory_reaches_the_terminal(self):
+        evil = str(self.plain / "x\x1b]0;title\x07y\x7fz")
+        text = self.line(self.agy(cwd=evil, workspace={"current_dir": evil}))
+        self.assertEqual(text, "🔒 sandbox · x]0;titleyz")
+
+    def test_the_directory_is_the_workspaces_then_the_cwds_then_a_placeholder(self):
+        other = self.plain.parent / "gadgets"
+        other.mkdir()
+        for payload, shown in (
+                ({"workspace": {"current_dir": str(self.plain)}, "cwd": str(other)},
+                 "widgets"),
+                ({"cwd": str(other)}, "gadgets"),
+                ({}, "workspace")):
+            with self.subTest(shown=shown):
+                self.assertEqual(self.line(payload), f"🔒 sandbox · {shown}")
+
+    def test_the_branch_shows_inside_a_repo_only(self):
+        self.assertEqual(self.line(self.agy()), "🔒 sandbox · widgets")
+        subprocess.run(  # noqa: S603 (absolute path from shutil.which, fixed args)
+            [_GIT, "init", "-q", "-b", "gizmo", str(self.plain)], check=True,
+            capture_output=True, timeout=60)
+        self.assertEqual(self.line(self.agy()), "🔒 sandbox · widgets · ⎇ gizmo")
+
+    def test_the_context_segment_hides_without_a_current_figure(self):
+        def window(**over):
+            return {"total_input_tokens": 142000, "context_window_size": 1000000,
+                    "current_usage": {"input_tokens": 142000}, **over}
+        for name, cw in (("no current usage", window(current_usage=None)),
+                         ("a zero total", window(total_input_tokens=0)),
+                         ("a zero size", window(context_window_size=0)),
+                         ("a string total", window(total_input_tokens="142000")),
+                         ("a string size", window(context_window_size="1000000")),
+                         ("no size", {"total_input_tokens": 142000,
+                                      "current_usage": {"input_tokens": 1}})):
+            with self.subTest(case=name):
+                self.assertEqual(self.line(self.claude(context_window=cw)),
+                                 "🔒 sandbox · widgets · id abcdef01 · 5h 30% · 7d 60%")
 
 
 if __name__ == "__main__":

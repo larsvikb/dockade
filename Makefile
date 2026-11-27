@@ -108,11 +108,11 @@ SCRIPTS := $(LAUNCHERS) \
            sandbox-common/entrypoint.sh \
            sandbox-common/boundary-check.sh \
            sandbox-common/operator-instructions.sh \
+           sandbox-common/statusline.sh \
            claude-sandbox/tier-setup.sh \
            opencode-sandbox/tier-setup.sh \
            antigravity-sandbox/tier-setup.sh \
            antigravity-sandbox/agy-wrapper.sh \
-           claude-sandbox/statusline.sh \
            claude-sandbox/claude-wrapper.sh
 DOCKERFILES := claude-sandbox/Dockerfile opencode-sandbox/Dockerfile \
                antigravity-sandbox/Dockerfile \

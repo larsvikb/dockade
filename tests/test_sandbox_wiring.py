@@ -369,6 +369,43 @@ class AntigravityWiringTests(unittest.TestCase):
             'mv -f "$settings.tmp.$$" "$settings"'])
 
 
+class StatusLineWiringTests(unittest.TestCase):
+    """Each tier's settings point at the path its Dockerfile bakes the one shared
+    status-line script to, root-owned. The script is run in
+    tests/test_antigravity_setup.py."""
+
+    SOURCE = "sandbox-common/statusline.sh"
+
+    def tiers(self):
+        """(image dir, its settings file, the path the settings point at)."""
+        for image_dir, settings in (("claude-sandbox", "user-settings.json"),
+                                    ("antigravity-sandbox", "settings.json")):
+            doc = json.loads((ROOT / image_dir / settings).read_text())
+            yield image_dir, settings, doc["statusLine"]
+
+    def test_each_settings_points_at_a_command_under_its_image_dir(self):
+        self.assertEqual({image_dir: line for image_dir, _, line in self.tiers()}, {
+            "claude-sandbox": {"type": "command",
+                               "command": "/etc/claude-code/statusline.sh"},
+            "antigravity-sandbox": {"type": "command",
+                                    "command": "/etc/antigravity/statusline.sh"}})
+
+    def test_each_dockerfile_bakes_the_shared_script_where_its_settings_point(self):
+        # A plain COPY, with no --chown, leaves the file root's; the chmod runs as
+        # root, the last USER before it.
+        for image_dir, _, line in self.tiers():
+            with self.subTest(image=image_dir):
+                path = line["command"]
+                dockerfile = (ROOT / image_dir / "Dockerfile").read_text()
+                copy = f"\nCOPY {self.SOURCE} {path}\n"
+                self.assertEqual(dockerfile.count(copy), 1)
+                self.assertEqual(dockerfile.count(path), 2)
+                chmod = dockerfile.index(f"&& chmod 0755 {path} \\\n")
+                self.assertLess(dockerfile.index(copy), chmod)
+                users = re.findall(r"^USER .*", dockerfile[:chmod], re.M)
+                self.assertEqual(users[-1], "USER root")
+
+
 class JdkVariantWiringTests(unittest.TestCase):
     """The opt-in JDK across the Dockerfile, the boot hook and the launcher.
 

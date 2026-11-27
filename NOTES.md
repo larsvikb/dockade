@@ -1864,6 +1864,45 @@ session that built the tier.
 - *Boundary.* `./run-antigravity-sandbox.sh --boundary-check` passed all 29 checks,
   among them `daily-cloudcode-pa.googleapis.com` reachable through the proxy.
 
+**agy 1.5.17's status line, before and after a turn.** On 2026-11-26 the agy session
+that planned #465 ran agy 1.5.17 in a PTY with a `statusLine` command
+(`{"type": "command", "command": …}`) given by `--settings`, not by the user
+`settings.json`, and reported this of the call before the first turn in the task's
+note 992:
+
+- agy ran the command on startup.
+- The command's environment held `$DOCKADE_SESSION_ID`.
+- Its stdin JSON held `"session_id": ""` and `"context_window":
+  {"total_input_tokens": 0, "context_window_size": 0, "current_usage": null}`,
+  and no `rate_limits`.
+
+On 2026-11-27 the maintainer ran the host check for #465 on the reference machine:
+the image built from the task's branch, plain `agy` with the image's baked
+`settings.json` and no `--settings`, the workspace this repo's checkout.
+
+- *The line at startup* read `🔒 sandbox · dockade · ⎇ main · id <8 hex>`.
+- *The key across agy's rewrite.* After agy quit, `jq .statusLine` on
+  `~/.gemini/antigravity-cli/settings.json` gave the baked
+  `{"type": "command", "command": "/etc/antigravity/statusline.sh"}`.
+- *After turns.* With a stub that captured stdin and the environment as the
+  command, over two prompts in a new agy run, the line read `ctx 17k/1M 1%`, then
+  `ctx 26k/1M 2%`, with the same id prefix both times.
+- *The post-turn stdin.* `session_id` and `conversation_id` were both agy's
+  conversation id, not the launch's `$DOCKADE_SESSION_ID` the environment held.
+  `cwd` and `workspace.current_dir` were both the workspace path. `version` was
+  1.5.17. `context_window` held `total_input_tokens`, `total_output_tokens`,
+  `context_window_size` (1048576), `used_percentage`, `remaining_percentage` and
+  `current_usage` (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`,
+  `cache_read_input_tokens`). agy's `used_percentage` was `total_input_tokens` over
+  `context_window_size`. `total_input_tokens` was neither `current_usage`'s sum nor a
+  running total across the two turns (about 17k after the first, 26.7k after the
+  second): it is agy's own context figure. There was no `rate_limits`; a `quota`
+  object held `3p-5h`, `3p-weekly` and `gemini-weekly`, each with
+  `remaining_fraction`, `reset_time` and `reset_in_seconds`. The other keys were
+  `transcript_path`, `model` (`id`, `display_name`, `effort`), `exceeds_200k_tokens`,
+  `product`, `agent_state`, `vcs`, `sandbox` (`enabled`), `plan_tier`, `email` and
+  `terminal_width`.
+
 ## Local inference and the accelerator survey: in `opencode-sandbox/NOTES.md`
 
 Tier 2 is the only consumer of the local model, so its evidence sits beside it: the

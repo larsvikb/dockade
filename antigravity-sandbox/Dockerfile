@@ -155,6 +155,9 @@ COPY antigravity-sandbox/dotfiles/.bashrc.tier /home/$USERNAME/.bashrc.tier
 # Rendered from antigravity-sandbox/instructions.md by `make instructions`.
 COPY antigravity-sandbox/settings.json /etc/antigravity/settings.json
 COPY antigravity-sandbox/user-AGENTS.md /etc/antigravity/AGENTS.md.template
+# The status line settings.json points at, shared with claude-sandbox. Root-owned, so
+# the agent can repoint the setting but not edit the code it runs.
+COPY sandbox-common/statusline.sh /etc/antigravity/statusline.sh
 COPY antigravity-sandbox/tier-setup.sh /usr/local/bin/tier-setup.sh
 # Shadows nothing on PATH: the real binary is off it. Root-owned, so the agent
 # cannot edit it; mistake-prevention, not containment, as the file says.
@@ -167,6 +170,7 @@ COPY sandbox-common/boundary-check.sh /usr/local/bin/boundary-check.sh
 COPY sandbox-common/operator-instructions.sh /usr/local/lib/dockade/operator-instructions.sh
 RUN chmod 0644 /etc/antigravity/settings.json /etc/antigravity/AGENTS.md.template \
                /usr/local/lib/dockade/operator-instructions.sh \
+    && chmod 0755 /etc/antigravity/statusline.sh \
     && chmod 0755 /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh \
                   /usr/local/bin/boundary-check.sh /usr/local/bin/tier-setup.sh \
                   /usr/local/bin/agy \

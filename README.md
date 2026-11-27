@@ -555,6 +555,7 @@ dockade/
     init-firewall.sh        # default-deny egress firewall (governed/local/standalone)
     boundary-check.sh       # on-demand smoke test of the containment boundary
     operator-instructions.sh # sourced at boot: appends the operator's own instructions to the baked ones
+    statusline.sh           # the Claude and agy tiers' sandbox-indicator status line
     dotfiles/               # shared .bashrc / .gitconfig / .inputrc / .vimrc, baked into every tier
     instructions/           # the agent instructions' shared fragments (every-tier/, cloud-tier/, bashrc-shell/), in no image
       render.py             #   make instructions: each <tier>/instructions.md to the file it names
@@ -565,7 +566,6 @@ dockade/
     user-settings.json      # baked template, materialized to /config each boot
     instructions.md         # source of user-CLAUDE.md: its header, includes and vocabulary
     user-CLAUDE.md          # the agent's user-scope instructions, rendered; installed the same way
-    statusline.sh           # sandbox-indicator status line
     dotfiles/               # .bashrc.tier — tier-1 shell hook (claude-yolo alias)
   antigravity-sandbox/      # TIER 1 image — agy (Google's Antigravity CLI), governed egress
     Dockerfile

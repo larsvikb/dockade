@@ -3,5 +3,9 @@
   "agentMode": "",
   "permissions": {
     "allow": ["read_file(/refs)"]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "/etc/antigravity/statusline.sh"
   }
 }

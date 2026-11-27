@@ -639,7 +639,7 @@ class ResponseBodyTests(unittest.TestCase):
                  b'\n\n')
         discovery = gateway.execute.discovery
 
-        def post(entry, message, timeout=None):
+        def post(entry, message, deadline=None):
             # Through the real reader, as the server's bytes would go.
             return discovery.read_reply(io.BytesIO(reply), "text/event-stream", 1,
                                         lambda request: None)
@@ -683,7 +683,7 @@ class ResponseBodyTests(unittest.TestCase):
                  b'{"isError": true, "content": 5}}\n\n')
         discovery = gateway.execute.discovery
 
-        def post(entry, message, timeout=None):
+        def post(entry, message, deadline=None):
             return discovery.read_reply(io.BytesIO(reply), "text/event-stream", 1,
                                         lambda request: None)
         request = self._Request(json.dumps(

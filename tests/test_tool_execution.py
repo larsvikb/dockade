@@ -18,7 +18,9 @@ is every decision between them, which is the part that can be wrong.
 """
 from __future__ import annotations
 
+import contextlib
 import io
+import ipaddress
 import json
 import re
 import socket
@@ -120,9 +122,9 @@ class ExecutionTestCase(unittest.TestCase):
             self.asked.append((path, payload))
             return self.answer
 
-        def post(entry, message, timeout=None):
+        def post(entry, message, deadline=None):
             self.called.append({"entry": entry, "message": message,
-                                "timeout": timeout})
+                                "deadline": deadline})
             return read(self.execute.discovery, self.reply)
 
         self.execute._ask_control = ask_control
@@ -1037,7 +1039,7 @@ class UpstreamReplyTests(ExecutionTestCase):
                 self.parse(raw)
 
     def test_an_unreachable_server_is_reported_as_a_failed_call(self):
-        def boom(entry, message, timeout=None):
+        def boom(entry, message, deadline=None):
             raise self.execute.discovery.DiscoveryError("unreachable: refused")
 
         self.execute.discovery.post = boom
@@ -1048,10 +1050,14 @@ class UpstreamReplyTests(ExecutionTestCase):
 
     def test_a_call_gets_the_longer_timeout_not_the_discovery_one(self):
         # Enumeration waits for a sibling answering from memory; a call crosses the
-        # internet through a proxy that may be holding it for a human.
+        # internet through a proxy that may be holding it for a human. One deadline
+        # for the whole call, started as the dial starts.
         self.answer = {"decision": "allow", "reason": "ok"}
         self.execute.call("mcp-github__get_issue", {}, None)
-        self.assertEqual(self.called[0]["timeout"], self.execute.CALL_TIMEOUT)
+        deadline = self.called[0]["deadline"]
+        self.assertIsInstance(deadline, self.execute.discovery.Deadline)
+        self.assertEqual(deadline.budget, self.execute.CALL_TIMEOUT)
+        self.assertGreater(deadline.remaining(), self.execute.CALL_TIMEOUT - 5)
         self.assertGreater(self.execute.CALL_TIMEOUT,
                            self.execute.discovery.TIMEOUT)
 
@@ -1210,7 +1216,7 @@ class OutcomeRecordTests(ExecutionTestCase):
             with self.subTest(kind=kind):
                 self.rows.clear()
 
-                def boom(entry, message, timeout=None, _k=kind):
+                def boom(entry, message, deadline=None, _k=kind):
                     raise self.execute.discovery.DiscoveryError("no answer", kind=_k)
 
                 self.execute.discovery.post = boom
@@ -1443,7 +1449,7 @@ class OutcomeRecordTests(ExecutionTestCase):
         """One run of each way ``_run`` can return, by name, each returning the result
         the agent got."""
         def dial_fails(kind):
-            def boom(entry, message, timeout=None):
+            def boom(entry, message, deadline=None):
                 raise self.execute.discovery.DiscoveryError("no answer", kind=kind)
 
             def run():
@@ -1505,7 +1511,7 @@ class OutcomeRecordTests(ExecutionTestCase):
 
     def test_the_duration_is_the_dials(self):
         # The monotonic clock around the dial and its parse.
-        def slow(entry, message, timeout=None):
+        def slow(entry, message, deadline=None):
             time.sleep(0.05)
             return read(self.execute.discovery, self.reply)
         self.execute.discovery.post = slow
@@ -1712,6 +1718,61 @@ class OutcomeRecordTests(ExecutionTestCase):
             self.allow()
         self.assertEqual([(r["status"], r["reason"]) for r in self.rows],
                          [("tool-error", None)])
+
+    def _through_loopback(self, reply: bytes, drip: bytes = b"") -> dict:
+        """One allowed call through the real ``post`` to a server on loopback that
+        answers with ``reply``, then sends ``drip`` every 20 ms for up to 6 s, and the
+        result the agent got."""
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        done = threading.Event()
+        self.addCleanup(done.set)
+
+        def serve():
+            conn, _ = listener.accept()
+            with conn, contextlib.suppress(OSError):
+                conn.settimeout(6)
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    data += conn.recv(65536)
+                conn.sendall(reply)
+                until = time.monotonic() + 6
+                while drip and time.monotonic() < until and not done.wait(0.02):
+                    conn.sendall(drip)
+
+        threading.Thread(target=serve, daemon=True).start()
+        roster = [{**ROSTER[0], "endpoint": {"port": listener.getsockname()[1],
+                                             "path": "/mcp"}}]
+        self.execute.surface.publish(roster, [RESULT])
+        self.execute.discovery.post = self._real_post
+        with mock.patch.object(self.execute.discovery, "MCP_NET",
+                               ipaddress.ip_network("127.0.0.0/8")), \
+                mock.patch("socket.getaddrinfo",
+                           lambda host, port, *_a, **_k:
+                           [(2, 1, 6, "", ("127.0.0.1", port))]):
+            return self.allow()
+
+    def test_a_reply_over_the_cap_is_one_row_saying_the_request_was_sent(self):
+        with mock.patch.object(self.execute.discovery, "REPLY_MAX", 1000):
+            result = self._through_loopback(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Connection: close\r\n\r\n" + b" " * 1001)
+        self.assertTrue(result["isError"])
+        self.assertEqual([(row["status"], row["reason"]) for row in self.rows],
+                         [("transport-error", "the reply from mcp-github passed 1000 "
+                           "bytes and was not read further; the request was sent and "
+                           "may have run")])
+
+    def test_a_reply_overrunning_the_call_is_one_timeout_row(self):
+        started = time.monotonic()
+        with mock.patch.object(self.execute, "CALL_TIMEOUT", 0.5):
+            result = self._through_loopback(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 99999\r\n\r\n", b" ")
+        self.assertLess(time.monotonic() - started, 0.5 + 1.0)
+        self.assertTrue(result["isError"])
+        self.assertEqual([(row["status"], row["reason"]) for row in self.rows],
+                         [("timeout", "no complete reply from mcp-github within 0.5s")])
 
     def _with_answer(self, answer, name, args=None):
         self.answer = answer

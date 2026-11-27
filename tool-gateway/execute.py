@@ -83,10 +83,12 @@ _TERMINAL_TEXT = {
 #: statuses and the row's status is still ``expired``; ``_closed_text`` picks it.
 _LAPSED_TEXT = "A human approved this request, but the approval lapsed before it was resumed"
 
-#: How long a tool call may take. Its own number, an order of magnitude above
-#: ``discovery.TIMEOUT``, because the two wait for different things: enumeration is a
-#: sibling answering from memory, and this is a server making a real internet request
-#: through the egress proxy — which may itself be holding the request for a human.
+#: How long a tool call may take, as a whole: the dial, the reply and every answer the
+#: gateway sends on the call's stream (``discovery.Deadline``). Its own number, an
+#: order of magnitude above ``discovery.TIMEOUT``, because the two wait for different
+#: things: enumeration is a sibling answering from memory, and this is a server making
+#: a real internet request through the egress proxy — which may itself be holding the
+#: request for a human.
 CALL_TIMEOUT = float(os.environ.get("GATEWAY_CALL_TIMEOUT", "60"))
 
 #: The control plane's tool bridge. Same address discovery dials, and by ADDRESS for
@@ -396,7 +398,7 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
             entry,
             {"jsonrpc": "2.0", "method": "tools/call",
              "params": {"name": tool, "arguments": arguments}},
-            timeout=CALL_TIMEOUT)
+            deadline=discovery.Deadline(CALL_TIMEOUT))
         result, status = parse_call(response)
     except discovery.DiscoveryError as exc:
         # A failure to REACH the server, told apart from a failure reported BY it. The

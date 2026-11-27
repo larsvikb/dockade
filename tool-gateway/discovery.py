@@ -40,7 +40,9 @@ hand"; `make mcp-tools` is the same request by hand):
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
+import heapq
 import http.client
 import io
 import ipaddress
@@ -50,6 +52,7 @@ import os
 import re
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable, Iterator
@@ -78,6 +81,12 @@ _METHOD_SHOWN = 120
 #: the 200 characters the inventory keeps of a status. The reason can quote a reason
 #: phrase the server chose, of any length, once per request it sends.
 _FAILURE_SHOWN = 200
+
+#: How many lines one request may log of the server's requests refused and of answers
+#: not delivered or not sent, counted together; one more says the rest go unlogged. A
+#: server sending requests back to back would otherwise write a line for each, for as
+#: long as the call's deadline lets it.
+_REFUSALS_LOGGED = 16
 
 #: The most an SSE reply is read in at once. A read returns what has arrived, up to
 #: this, so a server's request is seen as soon as its event ends.
@@ -148,6 +157,13 @@ SECRETS_DIR = os.environ.get("GATEWAY_SECRETS_DIR", "/run/dockade/secrets")
 #: report rather than a thread. Short on purpose: these are all sibling containers on
 #: a local bridge, where a second is already an eternity.
 TIMEOUT = float(os.environ.get("GATEWAY_DISCOVERY_TIMEOUT", "5"))
+
+#: The most of one reply read, in bytes: every byte of the body counts, SSE comments,
+#: pings and the server's requests included. A reply is held whole before its outcome
+#: is recorded, so without a cap one large enough would take the gateway down first.
+#: 16 MiB because Claude Code reads no MCP response past 16 MB: a bigger result would
+#: cost the gateway memory and reach nobody.
+REPLY_MAX = int(os.environ.get("GATEWAY_REPLY_MAX", str(16 << 20)))
 
 
 class DiscoveryError(Exception):
@@ -481,7 +497,11 @@ def read_reply(stream, content_type: str | None, request_id: int, on_request) ->
     response, without waiting for the stream to end: a stateful server sends a request
     on a call's own stream and holds the call until it is answered, and may keep the
     stream open after the response (NOTES.md, "A stateful MCP server talks back on a
-    call's stream"). Any other type is read whole (``response_message``)."""
+    call's stream"). Any other type is read whole (``response_message``).
+
+    Bounds are the stream's, not this reader's: ``post`` hands it a ``_Reply``, whose
+    reads stop at ``REPLY_MAX`` bytes and at the request's deadline, so each event
+    before the cap is still parsed as it arrives."""
     media = (content_type or "").partition(";")[0].strip().lower()
     if media == "text/event-stream":
         return _response(_events(stream), request_id, on_request)
@@ -495,7 +515,9 @@ def response_message(raw: bytes, request_id: int) -> dict:
     Both shapes are accepted because a reply not labelled `text/event-stream` may still
     be framed as SSE, and a bare JSON body is legal for this transport: a reader that
     silently failed on either would be worse than one that kept working. A request in
-    such a body goes unanswered, since the server ended the reply before it was read."""
+    such a body goes unanswered, since the server ended the reply before it was read.
+    ``raw`` is already bounded: ``post`` reads it whole only to ``REPLY_MAX`` bytes
+    (``_Reply.read``)."""
     if re.search(rb"(?m)^data:", raw):
         return _response(_events(io.BytesIO(raw)), request_id, _unanswered)
     body = raw.decode("utf-8", "replace").strip()
@@ -518,6 +540,187 @@ def parse_tools(message: dict) -> list[dict]:
     return tools
 
 
+class Deadline:
+    """When a request, or a sequence of them, must have its reply: ``seconds`` from
+    now, on the monotonic clock. One is handed to every ``post`` on a path that shares
+    a bound, so each gets what the others left."""
+
+    def __init__(self, seconds: float):
+        self.budget = seconds
+        self.end = time.monotonic() + seconds
+
+    def remaining(self) -> float:
+        return self.end - time.monotonic()
+
+    def passed(self) -> bool:
+        return self.remaining() <= 0
+
+    def overrun(self, server: str) -> DiscoveryError:
+        """What a reply not complete by this deadline is recorded as: ``timeout``, the
+        word for a request that was out and may have run."""
+        return DiscoveryError(
+            f"no complete reply from {server} within {round(self.budget, 1)}s",
+            kind="timeout")
+
+
+class _Overrun(Exception):
+    """A dial's deadline passed: raised where that is found, and turned into the
+    deadline's ``overrun`` by ``_dial``. Not an OSError, so urllib passes it through
+    unwrapped."""
+
+
+class _Watch:
+    """One dial's place under the watchdog: its deadline, its socket once connected,
+    and whether the watchdog shut that socket down."""
+
+    def __init__(self, deadline: Deadline):
+        self.deadline = deadline
+        self.sock: socket.socket | None = None
+        self.registered = False
+        self.fired = False
+
+    def check(self) -> None:
+        """Raise ``_Overrun`` if the watchdog has fired: whatever a read returned
+        after that, a short body or the end of the stream, is the cut, not the
+        server's reply."""
+        if self.fired:
+            raise _Overrun()
+
+
+# One thread for every dial in flight, not one per dial. A read in http.client loops
+# over many socket reads, each with a fresh per-operation timeout, so a server sending
+# a byte at a time is never timed out by the socket: the bound has to come from
+# outside the read. The watchdog shuts the socket down at its deadline, which ends
+# whatever read is blocked on it. It holds socket objects, never descriptor numbers,
+# so a socket http.client has already closed costs an OSError, ignored, and never a
+# shutdown of a descriptor reused since.
+_WATCH_LOCK = threading.Condition()
+_WATCHED: list[tuple[float, int, _Watch]] = []
+_WATCH_ORDER = itertools.count()
+_WATCHER: threading.Thread | None = None
+
+
+def _watch(watch: _Watch, sock: socket.socket) -> None:
+    """Put a connected socket under the watchdog until its deadline, starting the
+    watchdog if no dial has it running."""
+    global _WATCHER
+    with _WATCH_LOCK:
+        watch.sock, watch.registered = sock, True
+        heapq.heappush(_WATCHED, (watch.deadline.end, next(_WATCH_ORDER), watch))
+        if _WATCHER is None:
+            # Named only once it runs: a start that raises (no thread to be had)
+            # fails this dial, and the next one tries again.
+            watcher = threading.Thread(target=_watchdog, name="dial-watchdog",
+                                       daemon=True)
+            watcher.start()
+            _WATCHER = watcher
+        _WATCH_LOCK.notify()
+
+
+def _unwatch(watch: _Watch) -> None:
+    """Take a finished dial off the watchdog, so its socket is not held to its
+    deadline."""
+    with _WATCH_LOCK:
+        watch.sock = None
+        kept = [item for item in _WATCHED if item[2] is not watch]
+        if len(kept) != len(_WATCHED):
+            _WATCHED[:] = kept
+            heapq.heapify(_WATCHED)
+            _WATCH_LOCK.notify()
+
+
+def _watchdog() -> None:
+    """Shut each watched socket down at its deadline, earliest first; exit once none
+    is left."""
+    global _WATCHER
+    with _WATCH_LOCK:
+        # However it exits, so the next dial starts another.
+        try:
+            while _WATCHED:
+                end, _order, watch = _WATCHED[0]
+                wait = end - time.monotonic()
+                if wait > 0:
+                    _WATCH_LOCK.wait(wait)
+                    continue
+                heapq.heappop(_WATCHED)
+                # Fired before the shutdown, so a read the shutdown ends sees it.
+                watch.fired = True
+                with contextlib.suppress(OSError):
+                    watch.sock.shutdown(socket.SHUT_RDWR)
+                watch.sock = None
+        finally:
+            _WATCHER = None
+
+
+class _BoundedConnection(http.client.HTTPConnection):
+    """An HTTP connection whose dial is bound by its ``_Watch``'s deadline: the
+    connect waits only what remains, and the socket is under the watchdog from the
+    moment it connects until ``_dial`` exits."""
+
+    def __init__(self, *args, watch: _Watch, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._watch_of = watch
+
+    def connect(self):
+        remaining = self._watch_of.deadline.remaining()
+        # Nothing left is the overrun, never a timeout of zero (non-blocking) or below
+        # (a ValueError) handed to the socket.
+        if remaining <= 0:
+            raise _Overrun()
+        self.timeout = remaining
+        super().connect()
+        _watch(self._watch_of, self.sock)
+
+
+class _BoundedHandler(urllib.request.HTTPHandler):
+    """urllib's HTTP handler, connecting through ``_BoundedConnection`` with the watch
+    ``_dial`` put on the request."""
+
+    def http_open(self, req):
+        return self.do_open(functools.partial(_BoundedConnection, watch=req.watch), req)
+
+
+class _Reply:
+    """A server's response as ``_dial`` yields it: every byte of the body read through
+    it is counted against ``REPLY_MAX``, and a read the watchdog cut short is the
+    overrun."""
+
+    def __init__(self, response, server: str, watch: _Watch):
+        self._response = response
+        self._server = server
+        self._watch_of = watch
+        self._count = 0
+        self.headers = response.headers
+
+    def _over(self) -> DiscoveryError:
+        return DiscoveryError(
+            f"the reply from {self._server} passed {REPLY_MAX} bytes and was not read "
+            f"further; the request was sent and may have run")
+
+    def _took(self, data: bytes) -> bytes:
+        self._watch_of.check()
+        self._count += len(data)
+        if self._count > REPLY_MAX:
+            raise self._over()
+        return data
+
+    def read1(self, size: int = -1) -> bytes:
+        return self._took(self._response.read1(size))
+
+    def read(self) -> bytes:
+        """The rest of the body, whole. A Content-Length past the cap is refused before
+        anything is read. Otherwise at most one byte past the cap is asked for, and a
+        body short of its Content-Length is refused as a whole read would refuse it,
+        since a capped read returns it short without a word."""
+        length = getattr(self._response, "length", None)
+        if length is not None and length > REPLY_MAX - self._count:
+            raise self._over()
+        data = self._took(self._response.read(REPLY_MAX + 1 - self._count))
+        if length is not None and len(data) < length:
+            raise http.client.IncompleteRead(data, length - len(data))
+        return data
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Refuse every redirect, so a 3xx surfaces as the HTTPError it is.
 
@@ -535,10 +738,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 #: The opener every dial goes through: urlopen's default handlers, with redirects
-#: refused and proxies off. Compose sets no proxy env on the gateway, but a Docker
-#: client's `proxies` config injects one into every container, and a dial through a
-#: proxy is not a dial to the address ``_placed`` chose.
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+#: refused, proxies off, and HTTP through ``_BoundedHandler``. Compose sets no proxy env
+#: on the gateway, but a Docker client's `proxies` config injects one into every
+#: container, and a dial through a proxy is not a dial to the address ``_placed`` chose.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect,
+                                      _BoundedHandler)
 
 
 def _body(message: dict) -> bytes:
@@ -569,7 +773,7 @@ def _next_id() -> int:
         return next(_IDS)
 
 
-def post(entry: dict, message: dict, timeout: float | None = None) -> dict:
+def post(entry: dict, message: dict, deadline: Deadline | None = None) -> dict:
     """One MCP request to the server a roster entry names, returning the JSON-RPC
     response to it.
 
@@ -577,14 +781,21 @@ def post(entry: dict, message: dict, timeout: float | None = None) -> dict:
     hold for enumeration and execution alike rather than for whichever one was written
     first. Both send the same headers, resolve the same derived secret path and get the
     same errors turned into `DiscoveryError`; the difference between them is the
-    message and the timeout, which is exactly what the two arguments are. ``_dial`` is
+    message and the deadline, which is exactly what the two arguments are. ``_dial`` is
     the dial itself, and nothing but this function and the answers it sends uses it.
+
+    ``deadline`` bounds the whole request, its reply read to the response and every
+    answer sent on the way included (``_dial``); None is a fresh ``TIMEOUT``, which
+    bounds a ``tools/list``. A caller with several requests on one path passes each the
+    same one, so each gets what the others left. The reply is read to ``REPLY_MAX``
+    bytes and no further (``_Reply``).
 
     The id is stamped here, on a copy of ``message``, and is new for every request
     (``_IDS``), so no caller can send a constant or a reused one; the response is the
     one that carries it (``read_reply``). A request the server sends on the call's
     stream is answered as it arrives (``_answer``), at the address and with the
-    headers the call went with.
+    headers the call went with, and at most ``_REFUSALS_LOGGED`` lines are logged of
+    them (``_capped_log``).
 
     The URL is built from what is checked here and from nothing else (``_dial``).
     ``check_name`` and ``check_endpoint`` run on every call, so neither the name nor
@@ -594,6 +805,8 @@ def post(entry: dict, message: dict, timeout: float | None = None) -> dict:
     (``_placed``), and once: an answer goes to the same address, not resolved again.
     The message is encoded before anything is resolved or dialled (``_body``), and one
     too deep to encode is a ``DiscoveryError``, never sent."""
+    if deadline is None:
+        deadline = Deadline(TIMEOUT)
     request_id = _next_id()
     data = _body({**message, "id": request_id})
     server = entry.get("server")
@@ -606,13 +819,27 @@ def post(entry: dict, message: dict, timeout: float | None = None) -> dict:
                "Host": f"{server}:{port}"}
     headers.update(auth_header(entry.get("auth") or {}, read_secret(server),
                                secret_path(server)))
-    # Resolved once, because the timeout REFUSAL names it: a record saying "no answer
-    # within None" would be worse than one that said nothing.
-    deadline = TIMEOUT if timeout is None else timeout
     target = (address, port, path)
+    log = _capped_log(server)
     with _dial(server, target, data, headers, deadline) as response:
-        return read_reply(response, response.headers.get("Content-Type"), request_id,
-                          lambda request: _answer(server, target, headers, request))
+        return read_reply(
+            response, response.headers.get("Content-Type"), request_id,
+            lambda request: _answer(server, target, headers, request, deadline, log))
+
+
+def _capped_log(server: str):
+    """A printer for one request's lines about its server's requests: the first
+    ``_REFUSALS_LOGGED`` print, then one saying the rest go unlogged."""
+    lines = itertools.count(1)
+
+    def log(text: str) -> None:
+        line = next(lines)
+        if line <= _REFUSALS_LOGGED:
+            print(f"tool-gateway: {outcomes.printable(server)}: {text}", flush=True)
+        elif line == _REFUSALS_LOGGED + 1:
+            print(f"tool-gateway: {outcomes.printable(server)}: further refusals and "
+                  f"undelivered answers on this request go unlogged", flush=True)
+    return log
 
 
 def _answer_to(request: dict) -> dict:
@@ -630,7 +857,8 @@ def _answer_to(request: dict) -> dict:
     return {"jsonrpc": "2.0", "id": request["id"], "error": dict(_NO_SUCH_METHOD)}
 
 
-def _answer(server: str, target: tuple, headers: dict, request: dict) -> None:
+def _answer(server: str, target: tuple, headers: dict, request: dict,
+            deadline: Deadline, log) -> None:
     """Answer a server's request while its call waits on the answer: a server holds a
     call open until a request it sent on the call's stream is answered (NOTES.md, "A
     stateful MCP server talks back on a call's stream").
@@ -638,32 +866,46 @@ def _answer(server: str, target: tuple, headers: dict, request: dict) -> None:
     To ``target`` and with ``headers``, the call's own, so it goes to the address
     ``_placed`` chose for the call through the same checked dial, carrying what the
     call carried. Its status is checked and its body left unread. A refusal is a line
-    in the log, the method escaped and capped, since it is the server's text. A failed
+    in ``log``, the method escaped and capped, since it is the server's text. A failed
     answer is a line as well and does not end the call: the call was sent, so its
     reply is still what the record needs, and a server left waiting ends as a timeout,
-    the honest status for a call that may have run."""
+    the honest status for a call that may have run.
+
+    Inside the call's ``deadline``: the answer gets the lesser of ``TIMEOUT`` and what
+    the call has left, so no answer extends the call. Once the call's time is up the
+    answer is not sent, which is a line as well, and the call ends as its overrun."""
     reply = _answer_to(request)
     method = outcomes.printable(request["method"])[:_METHOD_SHOWN]
     if "error" in reply:
-        print(f"tool-gateway: {outcomes.printable(server)}: refused its {method} "
-              f"request on a call's stream; nothing a server asks reaches the agent",
-              flush=True)
+        log(f"refused its {method} request on a call's stream; nothing a server asks "
+            f"reaches the agent")
+    if deadline.passed():
+        log(f"the answer to its {method} request was not sent — "
+            f"{outcomes.printable(deadline.overrun(server))[:_FAILURE_SHOWN]}")
+        raise _Overrun()
     try:
-        with _dial(server, target, _body(reply), headers, TIMEOUT):
+        with _dial(server, target, _body(reply), headers,
+                   Deadline(min(TIMEOUT, deadline.remaining()))):
             pass
     except DiscoveryError as exc:
-        print(f"tool-gateway: {outcomes.printable(server)}: the answer to its {method} "
-              f"request was not delivered — "
-              f"{outcomes.printable(exc)[:_FAILURE_SHOWN]}", flush=True)
+        log(f"the answer to its {method} request was not delivered — "
+            f"{outcomes.printable(exc)[:_FAILURE_SHOWN]}")
 
 
 @contextlib.contextmanager
 def _dial(server: str, target: tuple[str, int, str], data: bytes, headers: dict,
-          deadline: float):
+          deadline: Deadline):
     """``data`` POSTed to ``target``, an address, port and path ``post`` checked,
-    through ``_OPENER``, the response yielded open, and every way that can fail, its
-    reading included, turned into a ``DiscoveryError``. ``post``'s alone, for its
-    request and the answers it sends."""
+    through ``_OPENER``, the response yielded open as a ``_Reply``, and every way that
+    can fail, its reading included, turned into a ``DiscoveryError``. ``post``'s alone,
+    for its request and the answers it sends.
+
+    Bound by ``deadline`` from the connect until this function exits, below
+    http.client: the connect waits only what remains, and the watchdog shuts the
+    socket down when the deadline passes, whatever read is under way. A deadline
+    already passed dials nothing."""
+    if deadline.passed():
+        raise deadline.overrun(server)
     address, port, path = target
     # The URL is assembled here and nowhere else, and the scheme is a literal, so there
     # is no S310 to suppress: the address is one `_placed` has put on mcp-net, and the
@@ -671,9 +913,21 @@ def _dial(server: str, target: tuple[str, int, str], data: bytes, headers: dict,
     host = f"[{address}]" if ":" in address else address
     request = urllib.request.Request(f"http://{host}:{port}{path}", data=data,
                                      headers=headers)
+    watch = request.watch = _Watch(deadline)
     try:
-        with _OPENER.open(request, timeout=deadline) as response:
-            yield response
+        try:
+            # The timeout here is replaced at the connect by what then remains.
+            with _OPENER.open(request, timeout=deadline.budget) as response:
+                yield _Reply(response, server, watch)
+        except Exception as exc:
+            # THE OVERRUN FIRST. Once the watchdog has shut the socket down, any
+            # failure is that cut, never what the server sent; so is a socket timeout
+            # once the socket was connected, which only beat the watchdog to it. The
+            # request was out, so it is `timeout`: an approved write may have landed.
+            if (isinstance(exc, _Overrun) or watch.fired
+                    or (watch.registered and _timed_out(exc))):
+                raise deadline.overrun(server) from exc
+            raise
     except urllib.error.HTTPError as exc:
         # The reason phrase and the Location are the SERVER'S text, and this message is
         # printed to the log an operator reads: repr, so a CR or an escape sequence
@@ -689,16 +943,13 @@ def _dial(server: str, target: tuple[str, int, str], data: bytes, headers: dict,
                 f"{where}") from exc
         raise DiscoveryError(f"HTTP {exc.code} from {server} — {exc.reason!r}") from exc
     except (urllib.error.URLError, OSError) as exc:
-        # TIMEOUT SEPARATED FIRST, because it is the only one of these that leaves the
-        # call's fate unknown: the request was sent and the answer never came, so an
-        # approved write may well have landed. urlopen surfaces it either bare (it is
-        # an OSError subclass) or wrapped in URLError, and both spellings occur — the
-        # wrapped one on a connect timeout, the bare one on a read timeout.
-        timed_out = isinstance(exc, TimeoutError) or isinstance(
-            getattr(exc, "reason", None), TimeoutError)
-        if timed_out:
-            raise DiscoveryError(f"no answer from {server} within {deadline}s",
-                                 kind="timeout") from exc
+        # TIMEOUT SEPARATED FIRST: a timeout here is the connect's, since one after it
+        # is the overrun above. Nothing was received, so it keeps the wording it always
+        # had, and the kind (task 443).
+        if _timed_out(exc):
+            raise DiscoveryError(
+                f"no answer from {server} within {round(deadline.budget, 1)}s",
+                kind="timeout") from exc
         raise DiscoveryError(f"unreachable: {exc}") from exc
     except http.client.HTTPException as exc:
         # A reply that is not HTTP (`BadStatusLine` and kin), which is not an OSError,
@@ -706,6 +957,16 @@ def _dial(server: str, target: tuple[str, int, str], data: bytes, headers: dict,
         # server's included. AFTER the OSError clause, so `RemoteDisconnected`, which
         # is both, still reads as unreachable.
         raise DiscoveryError(f"not an HTTP reply from {server}: {exc!r}") from exc
+    finally:
+        _unwatch(watch)
+
+
+def _timed_out(exc: BaseException) -> bool:
+    """Whether ``exc`` is a socket timeout. urlopen surfaces one either bare (it is an
+    OSError subclass) or wrapped in URLError, and both spellings occur: the wrapped one
+    on a connect timeout, the bare one on a read timeout."""
+    return isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None),
+                                                        TimeoutError)
 
 
 def _placed(server: str, port: int) -> str:

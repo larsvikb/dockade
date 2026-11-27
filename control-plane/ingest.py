@@ -77,9 +77,8 @@ DRAIN_BLOCK = int(os.environ.get("CONTROL_AUDIT_DRAIN_BLOCK", str(1 << 20)))
 # Egress lines are written as the proxy acts on an answer, so the grace is only slack
 # for a slow disk and the drain interval. A tool line is written when the CALL ends,
 # so its grace is the gateway's GATEWAY_CALL_TIMEOUT plus the same slack. That timeout
-# bounds each socket read, not the whole call (urllib's `timeout=`, in
-# ``discovery.post``), so a server that keeps trickling bytes can outrun this grace
-# and be reported as a stall (#63). The 60 is the gateway's default
+# bounds the whole call (``discovery.Deadline``), so no server, however it trickles
+# its reply, keeps a call open past it. The 60 is the gateway's default
 # (`tool-gateway/execute.py`), restated because that module is in another image;
 # tests/test_topology.py holds this at or above the effective timeout, compose's
 # included.

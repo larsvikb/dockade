@@ -1382,9 +1382,8 @@ stays still after answers (`_check_growth` in `control-plane/ingest.py`). Decisi
 the proxy makes alone, while nothing asks `/authorize`, are seen only by the first.
 The MCP gateway's outcome stream is watched the same way: every allowed
 `/tool/authorize` and every granted claim is a call whose end it records. Each stream
-has its own grace, because a tool line follows the call rather than the answer. The
-gateway's call timeout bounds each read rather than the whole call, so a server that
-keeps trickling bytes can outrun the grace and read as a stall (#63).
+has its own grace, because a tool line follows the call rather than the answer, and
+the gateway's call timeout bounds the whole call, so the grace covers it.
 
 Each transition into or out of a failure (a stream that will not drain, a stalled
 file, the watch itself raising, the drain loop dying) writes one `ingest` row, so the

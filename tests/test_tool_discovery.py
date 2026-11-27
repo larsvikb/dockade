@@ -666,7 +666,8 @@ class ServerRequestTests(unittest.TestCase):
         entry = {**ENTRY, "endpoint": {"port": upstream.port, "path": "/mcp"}}
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            response = self.discovery.post(entry, message or self.call, timeout=10)
+            response = self.discovery.post(entry, message or self.call,
+                                           self.discovery.Deadline(10))
         return response, out.getvalue().splitlines()
 
     def refusal(self, method: str) -> str:
@@ -749,7 +750,8 @@ class ServerRequestTests(unittest.TestCase):
         def call(who):
             message = {**self.call, "params": {"name": "t", "arguments": {"who": who}}}
             try:
-                results[who] = self.discovery.post(entry, message, timeout=10)
+                results[who] = self.discovery.post(entry, message,
+                                                   self.discovery.Deadline(10))
             except self.discovery.DiscoveryError as exc:
                 results[who] = str(exc)
 
@@ -872,7 +874,8 @@ class ServerRequestTests(unittest.TestCase):
         with mock.patch.object(self.discovery, "TIMEOUT", 0.3):
             response, lines = self.post(upstream)
         self.assertEqual(response["result"], _result("done"))
-        self.assertEqual(lines, [self.UNDELIVERED + "no answer from mcp-github within 0.3s"])
+        self.assertEqual(lines, [self.UNDELIVERED
+                                 + "no complete reply from mcp-github within 0.3s"])
 
     def test_why_an_answer_failed_is_logged_capped(self):
         # The reason phrase is the server's, of any length, once per request it sends.
@@ -895,6 +898,509 @@ class ServerRequestTests(unittest.TestCase):
         self.assertEqual(len(set(ids)), 3)
         self.assertTrue(all(type(ident) is int for ident in ids))
         self.assertEqual(message["id"], 1)
+
+    def _requests_then_result(self, method: str, count: int, answered: bool):
+        """An ``on_call`` sending ``count`` requests of ``method``, then the result,
+        once every one is answered if ``answered``."""
+        def on_call(handler, message, upstream):
+            if not answered:
+                upstream.server.shutdown()
+                upstream.server.socket.close()
+            handler.stream()
+            for ident in range(count):
+                handler.event({"jsonrpc": "2.0", "id": ident, "method": method})
+            if not answered or upstream.wait_for(lambda u: len(u.answers) >= count):
+                handler.event({"jsonrpc": "2.0", "id": message["id"],
+                               "result": _result("done")})
+        return on_call
+
+    def test_the_lines_one_request_logs_are_capped_and_every_request_answered(self):
+        cap = self.discovery._REFUSALS_LOGGED
+        upstream = _Upstream(self, self._requests_then_result("roots/list", cap + 5,
+                                                              answered=True))
+        response, lines = self.post(upstream)
+        self.assertEqual(response["result"], _result("done"))
+        self.assertEqual(len(upstream.answers), cap + 5)
+        self.assertEqual(lines, [self.refusal("roots/list")] * cap + [
+            "tool-gateway: mcp-github: further refusals and undelivered answers on "
+            "this request go unlogged"])
+
+    def test_pings_past_the_cap_are_all_answered_and_log_nothing(self):
+        cap = self.discovery._REFUSALS_LOGGED
+        upstream = _Upstream(self, self._requests_then_result("ping", cap + 5,
+                                                              answered=True))
+        response, lines = self.post(upstream)
+        self.assertEqual(response["result"], _result("done"))
+        self.assertEqual([answer["message"]["result"] for answer in upstream.answers],
+                         [{}] * (cap + 5))
+        self.assertEqual(lines, [])
+
+    def test_refusals_and_undelivered_answers_share_one_cap(self):
+        # Each request here costs two lines, its refusal and its failed answer: two
+        # counters would print twice the cap.
+        cap = self.discovery._REFUSALS_LOGGED
+        upstream = _Upstream(self, self._requests_then_result("roots/list", cap + 5,
+                                                              answered=False))
+        response, lines = self.post(upstream)
+        self.assertEqual(response["result"], _result("done"))
+        self.assertEqual(len(lines), cap + 1)
+        self.assertEqual(lines[0], self.refusal("roots/list"))
+        self.assertTrue(lines[1].startswith(
+            "tool-gateway: mcp-github: the answer to its roots/list request was not "
+            "delivered — unreachable: "), lines[1])
+        self.assertEqual(lines[-1], "tool-gateway: mcp-github: further refusals and "
+                                    "undelivered answers on this request go unlogged")
+
+
+#: How far past its deadline a bounded dial may end, for a loaded machine. Each timing
+#: test below is built so that the bound it checks failing costs seconds more than this.
+SLACK = 1.0
+
+
+def _read_request(conn: socket.socket) -> dict:
+    """One HTTP request off ``conn``, its JSON body parsed."""
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = conn.recv(65536)
+        if not chunk:
+            raise OSError("the client went away")
+        data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    length = int(re.search(rb"(?i)\r\ncontent-length: *(\d+)", head).group(1))
+    while len(body) < length:
+        body += conn.recv(65536)
+    return json.loads(body)
+
+
+class _Raw:
+    """A server on loopback writing bytes as given, for replies http.server will not
+    send: for each connection it reads the request, writes ``head(id)``, the request's
+    id, then ``drip`` every ``gap`` seconds until the client goes, the test ends or
+    ``GIVE_UP`` seconds pass. With no drip it closes after the head. Each wait is
+    bounded, so a dial that is not bounded fails its test rather than hanging it."""
+
+    GIVE_UP = 6
+
+    def __init__(self, test, head, drip: bytes = b"", gap: float = 0.02):
+        self.head, self.drip, self.gap = head, drip, gap
+        self.connections = 0
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.listener.settimeout(0.1)
+        self.port = self.listener.getsockname()[1]
+        self.done = threading.Event()
+        test.addCleanup(self.listener.close)
+        test.addCleanup(self.done.set)
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while not self.done.is_set():
+            try:
+                conn, _ = self.listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            self.connections += 1
+            with conn, contextlib.suppress(OSError):
+                conn.settimeout(self.GIVE_UP)
+                conn.sendall(self.head(_read_request(conn)["id"]))
+                until = time.monotonic() + self.GIVE_UP
+                while self.drip and time.monotonic() < until \
+                        and not self.done.wait(self.gap):
+                    conn.sendall(self.drip)
+
+
+def _head(content_type: str = "application/json", *extra: str) -> bytes:
+    """A 200 status line and headers, ``extra`` among them, ending the head."""
+    return ("HTTP/1.1 200 OK\r\nContent-Type: " + content_type + "\r\n"
+            + "".join(f"{line}\r\n" for line in extra) + "Connection: close\r\n\r\n"
+            ).encode()
+
+
+def _chunked(body: bytes) -> bytes:
+    """``body`` as one chunk and the last chunk."""
+    return b"%x\r\n%s\r\n0\r\n\r\n" % (len(body), body)
+
+
+def _json_of(size: int):
+    """A JSON response to the request, padded with spaces to ``size`` bytes."""
+    def body(request_id):
+        message = json.dumps({"jsonrpc": "2.0", "id": request_id,
+                              "result": _result("done")}).encode()
+        return message + b" " * (size - len(message))
+    return body
+
+
+def _sse_of(size: int):
+    """An SSE stream of ``size`` bytes: a comment, then the response, whose blank line
+    is the last byte."""
+    def body(request_id):
+        event = (b"data: " + json.dumps({"jsonrpc": "2.0", "id": request_id,
+                                         "result": _result("done")}).encode()
+                 + b"\n\n")
+        return b": " + b"x" * (size - len(event) - 3) + b"\n" + event
+    return body
+
+
+class _LoopbackCase(unittest.TestCase):
+    """``post`` through the real urllib to a server on loopback, getaddrinfo patched as
+    in ServerRequestTests: every name is 127.0.0.1."""
+
+    def setUp(self):
+        self.discovery = load_discovery({"GATEWAY_MCP_NET": "127.0.0.0/8"})
+        self.discovery.read_secret = lambda server: "the-token"
+        patcher = mock.patch("socket.getaddrinfo",
+                             lambda host, port, *_a, **_k:
+                             [(2, 1, 6, "", ("127.0.0.1", port))])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def entry(self, port: int, server: str = "mcp-github") -> dict:
+        return {**ENTRY, "server": server, "endpoint": {"port": port, "path": "/mcp"}}
+
+    def post(self, port: int, deadline=None) -> dict:
+        return self.discovery.post(self.entry(port), {"method": "tools/call"}, deadline)
+
+    def refused(self, port: int, deadline=None):
+        """The DiscoveryError ``post`` ends with, and how long it took."""
+        started = time.monotonic()
+        with self.assertRaises(self.discovery.DiscoveryError) as caught:
+            self.post(port, deadline)
+        return caught.exception, time.monotonic() - started
+
+
+class ReplyCapTests(_LoopbackCase):
+    """A reply is read to ``REPLY_MAX`` bytes and no further, on both of the reader's
+    paths, before anything parses it past the cap."""
+
+    CAP = 4096
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(self.discovery, "REPLY_MAX", self.CAP)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def over(self) -> str:
+        return (f"the reply from mcp-github passed {self.CAP} bytes and was not read "
+                f"further; the request was sent and may have run")
+
+    def answering(self, head, body):
+        return _Raw(self, lambda request_id: head + body(request_id)).port
+
+    def test_a_reply_of_exactly_the_cap_is_read(self):
+        size = self.CAP
+        for label, head, body in (
+                ("json, sized", _head("application/json", f"Content-Length: {size}"),
+                 _json_of(size)),
+                ("json, to the close", _head(), _json_of(size)),
+                ("sse", _head("text/event-stream", "Transfer-Encoding: chunked"),
+                 lambda ident: _chunked(_sse_of(size)(ident)))):
+            with self.subTest(reply=label):
+                response = self.post(self.answering(head, body))
+                self.assertEqual(response["result"], _result("done"))
+
+    def test_a_reply_one_byte_over_the_cap_is_refused_as_sent(self):
+        size = self.CAP + 1
+        for label, head, body in (
+                ("json, to the close", _head(), _json_of(size)),
+                ("json, chunked", _head("application/json", "Transfer-Encoding: chunked"),
+                 lambda ident: _chunked(_json_of(size)(ident))),
+                ("sse, the extra byte before the response ends",
+                 _head("text/event-stream", "Transfer-Encoding: chunked"),
+                 lambda ident: _chunked(_sse_of(size)(ident)))):
+            with self.subTest(reply=label):
+                error, _took = self.refused(self.answering(head, body))
+                self.assertEqual((str(error), error.kind),
+                                 (self.over(), "transport-error"))
+
+    def test_a_content_length_over_the_cap_is_refused_before_reading(self):
+        # A few bytes, then the close: read up to the cap, this would be a body cut
+        # short, not one too large.
+        head = _head("application/json", f"Content-Length: {self.CAP + 1}")
+        error, _took = self.refused(self.answering(head, lambda ident: b"{ " * 5))
+        self.assertEqual((str(error), error.kind), (self.over(), "transport-error"))
+
+    def test_a_body_short_of_its_content_length_is_still_refused(self):
+        # A whole response under a length it does not reach. A read to the cap
+        # returns it short without a word, and it would parse.
+        head = _head("application/json", "Content-Length: 500")
+        error, _took = self.refused(self.answering(head, _json_of(100)))
+        self.assertEqual(error.kind, "transport-error")
+        self.assertTrue(str(error).startswith(
+            "not an HTTP reply from mcp-github: IncompleteRead(100 bytes read, 400 "
+            "more expected)"), str(error))
+
+
+class DeadlineTests(_LoopbackCase):
+    """One deadline bounds a request whole, whatever the server does to stay under a
+    per-read timeout: each ends as the overrun soon after its deadline. A wrapper on the
+    response alone would not end the first three or the trailer flood, which block
+    inside one http.client read."""
+
+    def overrun(self, budget: float, server: str = "mcp-github") -> str:
+        return f"no complete reply from {server} within {budget}s"
+
+    def test_a_server_holding_its_reply_under_a_per_read_timeout_overruns(self):
+        sse = ("text/event-stream", "Transfer-Encoding: chunked")
+        for label, head, drip in (
+                ("a trickled header", b"HTTP/1.1 200 OK\r\nX-Slow: ", b"x"),
+                ("a trickled chunk-size line", _head(*sse), b"0"),
+                ("a trickled body", _head("application/json", "Content-Length: 99999"),
+                 b" "),
+                ("a flood of trailer lines", _head(*sse) + b"0\r\n", b"X-T: 1\r\n"),
+                ("sse pings back to back", _head(*sse), _chunked(b": ping\n\n")[:-5])):
+            with self.subTest(reply=label):
+                server = _Raw(self, lambda _ident, head=head: head, drip)
+                error, took = self.refused(server.port, self.discovery.Deadline(0.5))
+                self.assertEqual((str(error), error.kind),
+                                 (self.overrun(0.5), "timeout"))
+                self.assertLess(took, 0.5 + SLACK)
+
+    def test_a_stalled_answer_cannot_hold_a_call_past_its_deadline(self):
+        # The answer's own bound is TIMEOUT, here far past the call's: only the lesser
+        # of the two ends the call in time.
+        def on_call(handler, message, upstream):
+            handler.stream()
+            handler.event({"jsonrpc": "2.0", "id": 5, "method": "ping"})
+            if upstream.wait_for(lambda u: len(u.answers) >= 1):
+                time.sleep(_Upstream.WAIT)
+
+        upstream = _Upstream(self, on_call, answer_delay=3)
+        with mock.patch.object(self.discovery, "TIMEOUT", 30), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            error, took = self.refused(upstream.port, self.discovery.Deadline(0.5))
+        self.assertEqual((str(error), error.kind), (self.overrun(0.5), "timeout"))
+        self.assertLess(took, 0.5 + SLACK)
+        self.assertIn("the answer to its ping request was not delivered — no complete "
+                      "reply from mcp-github within", out.getvalue())
+
+    def test_an_answer_late_in_a_call_gets_only_what_the_call_has_left(self):
+        # The ping comes 1.8 s into a 2 s call: an answer given the call's whole
+        # budget, or TIMEOUT, would hold it to 3.8 s.
+        def on_call(handler, message, upstream):
+            handler.stream()
+            time.sleep(1.8)
+            handler.event({"jsonrpc": "2.0", "id": 5, "method": "ping"})
+            if upstream.wait_for(lambda u: len(u.answers) >= 1):
+                time.sleep(_Upstream.WAIT)
+
+        upstream = _Upstream(self, on_call, answer_delay=5)
+        with mock.patch.object(self.discovery, "TIMEOUT", 30), \
+                contextlib.redirect_stdout(io.StringIO()):
+            error, took = self.refused(upstream.port, self.discovery.Deadline(2.0))
+        self.assertEqual((str(error), error.kind), (self.overrun(2.0), "timeout"))
+        self.assertLess(took, 2.0 + SLACK)
+
+    def test_a_shorter_deadline_wakes_a_watchdog_waiting_on_a_longer_one(self):
+        long = _Raw(self, lambda _ident: _head("application/json",
+                                               "Content-Length: 99"), b" ")
+        threading.Thread(target=self.refused,
+                         args=(long.port, self.discovery.Deadline(3)),
+                         daemon=True).start()
+        until = time.monotonic() + 2
+        while not self.discovery._WATCHED and time.monotonic() < until:
+            time.sleep(0.01)
+        self.assertTrue(self.discovery._WATCHED)
+        short = _Raw(self, lambda _ident: _head("application/json",
+                                                "Content-Length: 99"), b" ")
+        error, took = self.refused(short.port, self.discovery.Deadline(0.5))
+        self.assertEqual((str(error), error.kind), (self.overrun(0.5), "timeout"))
+        self.assertLess(took, 0.5 + SLACK)
+
+    def test_a_watchdog_that_could_not_start_is_started_by_the_next_dial(self):
+        stalled = _Raw(self, lambda _ident: _head("application/json",
+                                                  "Content-Length: 99"), b" ")
+        real = threading.Thread.start
+        refused = []
+
+        def start_once(thread):
+            if not refused:
+                refused.append(thread)
+                raise RuntimeError("can't start new thread")
+            return real(thread)
+
+        with mock.patch.object(threading.Thread, "start", start_once), \
+                self.assertRaises(RuntimeError):
+            self.post(stalled.port, self.discovery.Deadline(0.5))
+        error, took = self.refused(stalled.port, self.discovery.Deadline(0.5))
+        self.assertEqual((str(error), error.kind), (self.overrun(0.5), "timeout"))
+        self.assertLess(took, 0.5 + SLACK)
+
+    def test_a_watchdog_that_raised_is_replaced_by_the_next_dial(self):
+        # The first dial is ended by its socket's own timeout, the watchdog having
+        # died; the second needs a watchdog, which only a cleared one lets it start.
+        real = self.discovery.heapq
+        failed = []
+
+        class FailingOnce:
+            heappush, heapify = real.heappush, real.heapify
+
+            @staticmethod
+            def heappop(heap):
+                if not failed:
+                    failed.append(True)
+                    raise RuntimeError("the watchdog's own bug")
+                return real.heappop(heap)
+
+        silent = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(silent.close)
+        with mock.patch.object(self.discovery, "heapq", FailingOnce), \
+                mock.patch.object(threading, "excepthook", lambda _args: None):
+            self.refused(silent.getsockname()[1], self.discovery.Deadline(0.3))
+        self.assertEqual(failed, [True])
+        stalled = _Raw(self, lambda _ident: _head("application/json",
+                                                  "Content-Length: 99"), b" ")
+        error, took = self.refused(stalled.port, self.discovery.Deadline(0.5))
+        self.assertEqual((str(error), error.kind), (self.overrun(0.5), "timeout"))
+        self.assertLess(took, 0.5 + SLACK)
+
+    def test_one_deadline_across_two_posts_leaves_the_second_what_remains(self):
+        slow = _Raw(self, lambda ident: (_head("application/json")
+                                         + _json_of(100)(ident)))
+        slow.head = lambda ident, real=slow.head: (time.sleep(1.0), real(ident))[1]
+        stalled = _Raw(self, lambda _ident: _head("application/json",
+                                                  "Content-Length: 99"), b" ")
+        deadline = self.discovery.Deadline(1.5)
+        started = time.monotonic()
+        self.assertEqual(self.post(slow.port, deadline)["result"], _result("done"))
+        error, _took = self.refused(stalled.port, deadline)
+        self.assertEqual((str(error), error.kind), (self.overrun(1.5), "timeout"))
+        self.assertLess(time.monotonic() - started, 1.5 + SLACK / 2)
+
+    def test_a_deadline_already_passed_dials_nothing(self):
+        opened = []
+        with mock.patch.object(self.discovery._OPENER, "open",
+                               lambda *a, **k: opened.append(a)):
+            error, _took = self.refused(9, self.discovery.Deadline(0))
+        self.assertEqual((str(error), error.kind), (self.overrun(0), "timeout"))
+        self.assertEqual(opened, [])
+
+    def test_a_request_after_the_deadline_is_not_answered_and_the_call_overruns(self):
+        # Read late, past a deadline no watchdog enforces here: the stand-in for the
+        # dial has no socket.
+        dialled = []
+
+        @contextlib.contextmanager
+        def late(request, *_args, **_kwargs):
+            dialled.append(request)
+            time.sleep(0.3)
+            ident = json.loads(request.data)["id"]
+            yield Reply('data: {"jsonrpc": "2.0", "id": 5, "method": "ping"}\n\n'
+                        + sse({}, ident))
+
+        with mock.patch.object(self.discovery._OPENER, "open", late), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            error, _took = self.refused(9, self.discovery.Deadline(0.1))
+        self.assertEqual((str(error), error.kind), (self.overrun(0.1), "timeout"))
+        self.assertEqual(len(dialled), 1)
+        self.assertEqual(out.getvalue().splitlines(), [
+            "tool-gateway: mcp-github: the answer to its ping request was not sent — "
+            + self.overrun(0.1)])
+
+    def test_nothing_left_at_the_connect_is_the_overrun_not_a_socket_error(self):
+        # Between the check before the dial and the connect, the time can run out; a
+        # timeout of zero would make the connect non-blocking, one below it raise.
+        listener = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(listener.close)
+        for left in (0.0, -1.0):
+            with self.subTest(left=left):
+                deadline = self.discovery.Deadline(5)
+                deadline.passed = lambda: False
+                deadline.remaining = lambda left=left: left
+                error, _took = self.refused(listener.getsockname()[1], deadline)
+                self.assertEqual((str(error), error.kind), (self.overrun(5), "timeout"))
+
+    def test_a_deadline_with_nothing_left_has_passed(self):
+        deadline = self.discovery.Deadline(5)
+        for left, passed in ((0.0, True), (-0.1, True), (0.1, False)):
+            with self.subTest(left=left):
+                deadline.remaining = lambda left=left: left
+                self.assertIs(deadline.passed(), passed)
+
+    def test_the_connect_waits_only_what_remains(self):
+        waited = []
+
+        def create_connection(_address, timeout, *_args, **_kwargs):
+            waited.append(timeout)
+            raise ConnectionRefusedError("refused")
+
+        deadline = self.discovery.Deadline(5)
+        deadline.remaining = lambda: 2.0
+        with mock.patch("socket.create_connection", create_connection):
+            self.refused(9, deadline)
+        self.assertEqual(waited, [2.0])
+
+    def test_a_body_to_the_close_cut_at_the_deadline_is_the_overrun(self):
+        # What arrived before the cut parses; it is still not the server's reply.
+        server = _Raw(self, lambda ident: _head() + _json_of(100)(ident), b" ")
+        error, took = self.refused(server.port, self.discovery.Deadline(0.5))
+        self.assertEqual((str(error), error.kind), (self.overrun(0.5), "timeout"))
+        self.assertLess(took, 0.5 + SLACK)
+
+    def test_a_socket_timeout_once_connected_is_the_overrun(self):
+        # The socket's own timeout and the watchdog end together; the socket winning
+        # must not read as the connect's "no answer". The watchdog is stood down, and
+        # the listener never accepts: the kernel completes the connect, nothing answers.
+        self.discovery._watchdog = lambda: None
+        silent = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(silent.close)
+        error, took = self.refused(silent.getsockname()[1],
+                                   self.discovery.Deadline(0.5))
+        self.assertEqual((str(error), error.kind), (self.overrun(0.5), "timeout"))
+        self.assertLess(took, 0.5 + SLACK)
+
+    def test_a_finished_dial_leaves_nothing_under_the_watchdog(self):
+        server = _Raw(self, lambda ident: _head() + _json_of(100)(ident))
+        self.post(server.port, self.discovery.Deadline(30))
+        self.assertEqual(self.discovery._WATCHED, [])
+
+    def test_a_connect_timeout_keeps_its_wording(self):
+        # Nothing was received, so not "no complete reply".
+        def create_connection(*_args, **_kwargs):
+            raise TimeoutError("timed out")
+
+        with mock.patch("socket.create_connection", create_connection):
+            error, _took = self.refused(9, self.discovery.Deadline(5))
+        self.assertEqual((str(error), error.kind),
+                         ("no answer from mcp-github within 5s", "timeout"))
+
+    def test_a_tools_list_is_bound_by_the_discovery_timeout_and_the_round_goes_on(self):
+        stalled = _Raw(self, lambda _ident: _head("application/json",
+                                                  "Content-Length: 99"), b" ")
+        fine = _Raw(self, lambda ident: _head("application/json")
+                    + json.dumps({"jsonrpc": "2.0", "id": ident,
+                                  "result": {"tools": []}}).encode())
+        started = time.monotonic()
+        with mock.patch.object(self.discovery, "TIMEOUT", 0.5):
+            results = self.discovery.reconcile_all(
+                [self.entry(stalled.port, "mcp-slow"), self.entry(fine.port)])
+        self.assertLess(time.monotonic() - started, 0.5 + SLACK)
+        self.assertEqual([(r["server"], r["status"]) for r in results],
+                         [("mcp-slow", self.overrun(0.5, "mcp-slow")),
+                          ("mcp-github", "ok")])
+
+    def test_a_deadline_passing_after_the_reply_leaves_the_next_dial_bound(self):
+        # The watchdog fires on a socket http.client closed at the end of the body,
+        # and the OSError that costs must not stop it watching the next dial.
+        fine = _Raw(self, lambda ident: (_head("application/json",
+                                               "Content-Length: 100")
+                                         + _json_of(100)(ident)))
+        real = self.discovery.read_reply
+
+        def read_then_wait(*args):
+            response = real(*args)
+            time.sleep(0.4)
+            return response
+
+        with mock.patch.object(self.discovery, "read_reply", read_then_wait):
+            self.assertEqual(self.post(fine.port, self.discovery.Deadline(0.2))
+                             ["result"], _result("done"))
+        stalled = _Raw(self, lambda _ident: _head("application/json",
+                                                  "Content-Length: 99"), b" ")
+        error, took = self.refused(stalled.port, self.discovery.Deadline(0.5))
+        self.assertEqual((str(error), error.kind), (self.overrun(0.5), "timeout"))
+        self.assertLess(took, 0.5 + SLACK)
 
 
 class _Chunks:

@@ -667,6 +667,46 @@ class ResponseBodyTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(hashed).hexdigest(), sha)
         self.assertIn(hashed, body)
 
+    def test_a_tool_error_whose_content_is_not_a_list_is_answered_and_recorded(self):
+        # As above, real but for the control plane's answer and the dial. The defect
+        # was a TypeError out of `execute`, so a 500 and no outcome line.
+        gateway = load_tool_gateway(GOOD)
+        gateway.execute.surface.publish(
+            [{"server": "mcp-github", "auth": {"type": "none"},
+              "endpoint": {"port": 8082, "path": "/mcp"},
+              "tools": [{"tool": "get_pr", "action": "allow"}]}],
+            [{"server": "mcp-github", "status": "ok", "rules": 1, "exposed": 1,
+              "tools": [{"name": "get_pr", "description": "", "inputSchema": {
+                  "type": "object"}}], "ruled_but_absent": [],
+              "exposed_but_unruled": []}])
+        reply = (b'data: {"jsonrpc": "2.0", "id": 1, "result": '
+                 b'{"isError": true, "content": 5}}\n\n')
+        discovery = gateway.execute.discovery
+
+        def post(entry, message, timeout=None):
+            return discovery.read_reply(io.BytesIO(reply), "text/event-stream", 1,
+                                        lambda request: None)
+        request = self._Request(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "mcp-github__get_pr", "arguments": {}}}).encode())
+        out = io.StringIO()
+        with mock.patch.object(gateway.execute, "_ask_control",
+                               lambda path, payload: {"decision": "allow",
+                                                      "reason": "ok"}), \
+                mock.patch.object(gateway.execute.discovery, "post", post), \
+                contextlib.redirect_stdout(out):
+            response = asyncio.run(gateway.mcp(request))
+        self.assertEqual(response.status_code, 200)
+        result = json.loads(response.body)["result"]
+        self.assertTrue(result["isError"])
+        self.assertIn(gateway.execute.MISSHAPEN, result["content"][0]["text"])
+        lines = [ln for ln in out.getvalue().splitlines() if ln.startswith("OUTCOME")]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("OUTCOME transport-error mcp-github__get_pr"))
+        # Its reason, and not only its status: `_run`'s catch-all is a transport-error
+        # too.
+        self.assertIn(gateway.execute.MISSHAPEN, lines[0])
+
 
 class SandboxHeaderTests(unittest.TestCase):
     """The id a sandbox sends in ``X-Dockade-Sandbox``, read by ``/mcp`` and relayed

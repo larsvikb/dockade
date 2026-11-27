@@ -149,13 +149,39 @@ def _first_text(result: dict) -> str | None:
     Defensive about the shape on purpose: this reads a THIRD PARTY's reply on the
     failure path, where the reply is least likely to be well formed, and a record that
     raised while describing an error would lose both the reason and the row. A result
-    whose content is absent, empty, or not text yields None — the status still says
-    what happened, and an absent reason is honest where a stringified dict would be
-    noise."""
-    for block in result.get("content") or ():
+    whose content is absent, empty, not a list, or not text yields None — the status
+    still says what happened, and an absent reason is honest where a stringified dict
+    would be noise."""
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
         if isinstance(block, dict) and isinstance(block.get("text"), str):
             return block["text"]
     return None
+
+
+#: The `why` a result gets in ``_unsendable`` when its content fails ``_misshapen``.
+MISSHAPEN = "its content was not a list of objects, which MCP requires of a tool result"
+
+
+def _misshapen(result: dict) -> bool:
+    """Whether ``result``'s content is not one the agent's client can take.
+
+    MCP's ``CallToolResult`` makes ``content`` a list of content blocks, and every
+    reader of that list assumes at least that much, so that is the line drawn: a list
+    of objects. Absent passes, since the schema defaults it to empty; a block's own
+    fields are not checked, because the gateway is not an MCP validator.
+
+    TOTAL over anything ``json.loads`` produces — isinstance checks on a dict and
+    nothing that can raise — and that is what lets ``recorded`` call it outside its
+    encode's catch-all: a raise here would be the 500 with no row that ``recorded``
+    exists to rule out. A widened check has to stay total."""
+    if "content" not in result:
+        return False
+    content = result["content"]
+    return not (isinstance(content, list)
+                and all(isinstance(block, dict) for block in content))
 
 
 class Unanswered(discovery.DiscoveryError):
@@ -249,24 +275,32 @@ def parse_call(message: dict) -> tuple[dict, str]:
     return result, "tool-error" if result.get("isError") is True else "ok"
 
 
-def _unsendable(status: str, exc: Exception) -> tuple[dict, str]:
+def _unencodable(exc: Exception) -> str:
+    """The `why` for ``_unsendable`` when ``exc`` is what ``protocol.encode`` raised."""
+    # `UnicodeEncodeError` first: it is a `ValueError`.
+    if isinstance(exc, UnicodeEncodeError):
+        return "it held a lone surrogate, which UTF-8 cannot carry"
+    if isinstance(exc, ValueError):
+        return "it held NaN or an infinity, which JSON cannot carry"
+    return "the gateway failed while encoding it"
+
+
+def _unsendable(status: str, why: str,
+                said: str | None = None) -> tuple[dict, str]:
     """What the agent gets, and the record's reason, in place of a result the gateway
-    cannot send: ``exc`` is what ``protocol.encode`` raised on it.
+    cannot send: one that ``protocol.encode`` refuses (``_unencodable`` names why), or
+    one whose content the agent's client cannot take (``MISSHAPEN``). ``said`` is the
+    reason the row would have carried, a tool-error's first text, and follows ours
+    when it says anything.
 
     Fixed sentences that never quote the result, so the substitute is encodable by
     construction. Not repaired and delivered instead: escaping or nulling the bad
-    values would hand the agent content the server did not send. Two results can fail
-    to encode: a server's own, and an rpc-error text quoting a server's string error
-    (every other result's text is fixed or carries no server-supplied string). Only
-    the first RAN, which the agent must hear: an approved write that landed is
-    otherwise taken for one that did not."""
-    # `UnicodeEncodeError` first: it is a `ValueError`.
-    if isinstance(exc, UnicodeEncodeError):
-        why = "it held a lone surrogate, which UTF-8 cannot carry"
-    elif isinstance(exc, ValueError):
-        why = "it held NaN or an infinity, which JSON cannot carry"
-    else:
-        why = "the gateway failed while encoding it"
+    values, or reshaping the content, would hand the agent content the server did not
+    send. A server's own result can fail either way, and an rpc-error text quoting a
+    server's string error can fail to encode (every other result is fixed text or
+    carries no server-supplied string). Only a server's own result RAN, which the
+    agent must hear: an approved write that landed is otherwise taken for one that did
+    not."""
     if status in ("ok", "tool-error"):
         text = (f"The call ran on the server, but its result could not be passed on: "
                 f"{why}. Do not assume the call did not happen.")
@@ -275,6 +309,8 @@ def _unsendable(status: str, exc: Exception) -> tuple[dict, str]:
     else:
         text = f"The result of this call could not be passed on: {why}."
         reason = f"the {status} result could not be passed on: {why}"
+    if said:
+        reason = f"{reason}. The server said: {said}"
     return text_result(text, is_error=True), reason
 
 
@@ -312,16 +348,22 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
 
     def recorded(result: dict, status: str, reason: str | None = None) -> dict:
         # DECIDED HERE, before anything is written: unchecked, a result `app.py` cannot
-        # send would get a 500 there after an `ok` row here, and the record would hide
-        # the failure it exists to show. Encoded with the reply's own serializer, and on failure
-        # the substitute is both what is recorded and what is returned, so the row
-        # describes what the agent received. Any exception, not only the two named:
-        # one that escaped here would skip the record and leave a 500 with no row.
-        try:
-            protocol.encode(result)
-        except Exception as exc:  # noqa: BLE001 — must reach the record below
-            result, reason = _unsendable(status, exc)
+        # send would get a 500 there after an `ok` row here, and one the agent's client
+        # cannot take would be recorded as delivered, so the record would hide the
+        # failure it exists to show. On either, the substitute is both what is recorded
+        # and what is returned, so the row describes what the agent received. The
+        # shape first, and outside the try because `_misshapen` cannot raise. Encoded
+        # with the reply's own serializer, catching any exception, not only the two
+        # named: one that escaped here would skip the record and leave a 500 with no row.
+        if _misshapen(result):
+            result, reason = _unsendable(status, MISSHAPEN, reason)
             status = "transport-error"
+        else:
+            try:
+                protocol.encode(result)
+            except Exception as exc:  # noqa: BLE001 — must reach the record below
+                result, reason = _unsendable(status, _unencodable(exc))
+                status = "transport-error"
         outcomes.record(status, server, tool, reason=reason, resume_token=resume_token,
                         call_token=call_token, client=client, result=result,
                         duration=None if started is None
@@ -380,7 +422,8 @@ def _run(server: str, tool: str, arguments: object, client: str | None = None,
     # The reason line for a failure is the server's own text, which is what makes the
     # row worth reading — "Resource not accessible by personal access token" is the
     # sentence that was missing when this was discovered. Capped in `outcomes.record`,
-    # because it is third-party text.
+    # because it is third-party text. A result `recorded` replaces keeps that text
+    # after the gateway's own sentence saying why.
     return recorded(result, status,
                     None if status == "ok" else _first_text(result))
 

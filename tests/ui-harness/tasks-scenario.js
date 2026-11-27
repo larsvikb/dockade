@@ -374,6 +374,25 @@ export const STEPS = [
     await page.fill('#task-detail input[data-spec="blockers"]', "#2, 3");
     await page.click('#task-detail button[data-write="edit"]');
   }],
+  // Task 20's body is thousands of characters long: markdown typed key by key at its
+  // end, then approve, clicked while the edit holds it, sends nothing.
+  ["a refined task with a long body", async ({ page }) => {
+    await page.evaluate(() => { location.hash = "#task=20"; });
+  }],
+  ["its long spec opened for editing", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-open]");
+  }],
+  ["markdown typed at the long body's end", async ({ page }) => {
+    await page.click('#task-detail textarea[data-spec="body"]');
+    await page.keyboard.press("Control+End");
+    await page.keyboard.type("\n\n13. **Point 13.** With `code`.\n\n> A quote.\n");
+  }],
+  ["approve clicked while the long edit holds it", async ({ page }) => {
+    await page.click('#task-detail button[data-verb="approve"]', { force: true });
+  }],
+  ["the long edit discarded", async ({ page }) => {
+    await page.click("#task-detail button[data-spec-discard]");
+  }],
   // Task 18 is written in markdown, drawn as such and then as typed. A tree that draws
   // no switch takes the two steps as doing nothing, so the rest still compares.
   ["a task written in markdown", async ({ page }) => {

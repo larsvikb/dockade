@@ -22,7 +22,7 @@
  */
 import { lineDiff, wordDiff } from "./diff.js";
 import { escapeNonAscii, isHidden, NON_ASCII_RE } from "./escape.js";
-import { tokenize } from "./markdown.js";
+import { highlightRuns, tokenize } from "./markdown.js";
 import { pollStatus, renderListStatus } from "./list-status.js";
 import {
   TASK_STATES, NOT_RUNNING_STATUS, movesFor, noteMovesFor, isNoteMove,
@@ -533,16 +533,32 @@ export function resetText(reset) {
 // stored text its control changed or dropped. A field the edit leaves alone is stored
 // as it is, whatever its control shows.
 export function specPreview(base, draft, field) {
-  const control = SPEC_CONTROLS[field];
-  const sent = draftChanges(base, draft).includes(field);
-  const stored = base && typeof base === "object" ? base[field] : "";
-  const shown = spellHidden(sent ? draft[field] : stored);
-  const lost = sent ? controlChanges(stored, control) : 0;
-  const what = control === "text" ? "dropped" : "turned into line feeds";
+  const { sent, shown, lost } = storedAs(base, draft, field);
+  const what = SPEC_CONTROLS[field] === "text" ? "dropped" : "turned into line feeds";
   return { label: sent ? "will be stored" : "stored, and left as it is",
            text: shown.text, hidden: shown.hidden,
            lost: lost ? `${lost} line break${lost === 1 ? "" : "s"} of the stored ${field} `
                         + `${what} by this control.` : "" };
+}
+
+function storedAs(base, draft, field) {
+  const sent = draftChanges(base, draft).includes(field);
+  const stored = base && typeof base === "object" ? base[field] : "";
+  return { sent, shown: spellHidden(sent ? draft[field] : stored),
+           lost: sent ? controlChanges(stored, SPEC_CONTROLS[field]) : 0 };
+}
+
+// The line beside save and discard, which sit above the body's preview: what that
+// preview has to show, counted, so a save made without reading it is made knowing.
+// Empty when it has nothing.
+export function storedCount(base, draft) {
+  const { shown, lost } = storedAs(base, draft, "body");
+  const parts = [];
+  if (shown.hidden) {
+    parts.push(`${shown.hidden} hidden character${shown.hidden === 1 ? "" : "s"}`);
+  }
+  if (lost) parts.push(`${lost} line break${lost === 1 ? "" : "s"} turned into line feeds`);
+  return parts.length ? `The body's preview below shows ${parts.join(" and ")}.` : "";
 }
 
 // The save's label: the revision it edits, as approve names it, and when the task is
@@ -2495,9 +2511,12 @@ function noteSpecDrawn(task) {
 }
 
 // The spec as a form, in place of the lines that show it: each field's control, set
-// as a property from the draft, and under the title and body what will be stored,
+// as a property from the draft, and what the title and body will be stored as,
 // spelled (`markEdit` fills them as the operator types). A refined task says what an
-// edit does to its plan.
+// edit does to its plan. The body comes last, in a field that grows with its text
+// (`bodyField`), with save and discard right under it, so save follows every control
+// it sends; the body's preview comes after them, and a line beside them counts what
+// that preview has to show (`storedCount`).
 function specForm(task) {
   const form = document.createElement("div");
   form.className = "spec-form";
@@ -2505,13 +2524,7 @@ function specForm(task) {
   const amend = specAmendText(task);
   if (amend) form.appendChild(noticeLine({ text: amend, warn: true }));
   if (specEdit.rebased) form.appendChild(noticeLine({ text: specEdit.rebased, warn: true }));
-  for (const field of ["title", "body"]) {
-    form.appendChild(line(field, specControl(field)));
-    const preview = document.createElement("div");
-    preview.className = field === "body" ? "spec-preview task-body" : "spec-preview";
-    preview.dataset.specPreview = field;
-    form.appendChild(preview);
-  }
+  form.append(line("title", specControl("title")), specPreviewSlot("title"));
   const picks = document.createElement("div");
   picks.className = "moves";
   picks.append(line("severity", specControl("severity")), line("kind", specControl("kind")));
@@ -2522,6 +2535,9 @@ function specForm(task) {
   const problem = document.createElement("div");
   problem.dataset.specProblem = "1";
   form.appendChild(problem);
+  form.appendChild(line("body", bodyField()));
+  const saving = document.createElement("div");
+  saving.dataset.specSave = "1";
   const row = document.createElement("div");
   row.className = "moves";
   const save = writeButton(saveLabel(specEdit.base), "edit", "");
@@ -2531,9 +2547,69 @@ function specForm(task) {
   discard.dataset.specDiscard = "1";
   discard.textContent = "discard the edit";
   row.append(save, discard);
-  form.appendChild(row);
+  // One line high whatever it says, as the held line is, so filling it as the operator
+  // types moves neither button.
+  const count = document.createElement("div");
+  count.className = "held-line warn";
+  count.dataset.specCount = "1";
+  saving.append(row, count);
+  form.append(saving, specPreviewSlot("body"));
   return form;
 }
+
+// Where `markEdit` draws what a field will be stored as.
+function specPreviewSlot(field) {
+  const preview = document.createElement("div");
+  preview.className = field === "body" ? "spec-preview task-body" : "spec-preview";
+  preview.dataset.specPreview = field;
+  return preview;
+}
+
+// The body's textarea over a mirror of its text, in one grid cell (index.html, "the
+// body's field"): the mirror is in flow and sizes the cell, so the textarea is as tall
+// as its text and the page scrolls, not the field.
+function bodyField() {
+  const field = document.createElement("div");
+  field.className = "spec-field";
+  const mirror = document.createElement("div");
+  mirror.className = "spec-mirror";
+  mirror.dataset.specMirror = "1";
+  mirror.setAttribute("aria-hidden", "true");
+  const box = specControl("body");
+  field.append(mirror, box);
+  drawMirror(box);
+  return field;
+}
+
+// The mirror behind `box` drawn from its value in the colours `highlightRuns` gives it:
+// each run a text node, or a span made here with its text set as text, never parsed,
+// since the text is an agent's. Unlike every other draw of agent text it is not
+// spelled: to line up with the textarea it holds the characters as typed, as the
+// textarea does, and the body's preview spells them. A sentinel last, so a final line
+// end has a line's height, as it has in the textarea. The textarea's own text goes
+// transparent only once the mirror holds its value, so a highlighter that throws leaves
+// it drawn, over a mirror of the plain text that still sizes the field.
+function drawMirror(box) {
+  const field = box.parentElement;
+  const mirror = field.querySelector("[data-spec-mirror]");
+  field.classList.remove("mirrored");
+  const value = box.value;
+  try {
+    const nodes = highlightRuns(value).map(run => {
+      if (!run.cls) return document.createTextNode(run.text);
+      const span = document.createElement("span");
+      span.className = `hl-${run.cls}`;
+      span.textContent = run.text;
+      return span;
+    });
+    mirror.replaceChildren(...nodes, document.createTextNode(MIRROR_SENTINEL));
+    field.classList.add("mirrored");
+  } catch (e) {
+    mirror.replaceChildren(document.createTextNode(value + MIRROR_SENTINEL));
+  }
+}
+// Zero-width, so it gives a last empty line its height and widens no line.
+const MIRROR_SENTINEL = "\u200b";
 
 // One field's control, holding the draft's value. A select offers none and each value
 // the registry takes.
@@ -2575,8 +2651,9 @@ function editHolds() {
 }
 
 // What follows the draft, redrawn in place as the operator types, and once by each
-// draw: what title and body will be stored, why the blockers do not parse, the save,
-// off while it has nothing to send, and the moves a draft with changes holds.
+// draw: what title and body will be stored and the count beside the save, why the
+// blockers do not parse, the save, off while it has nothing to send, and the moves a
+// draft with changes holds.
 function markEdit() {
   const held = editHolds();
   for (const btn of taskDetail.querySelectorAll(HELD_MOVES)) {
@@ -2598,6 +2675,8 @@ function markEdit() {
     if (preview.hidden) el.appendChild(noticeLine({ text: hiddenNote(preview.hidden), warn: true }));
     if (preview.lost) el.appendChild(noticeLine({ text: preview.lost, warn: true }));
   }
+  const count = taskDetail.querySelector("[data-spec-count]");
+  if (count) count.textContent = storedCount(base, draft);
   const { bad } = parseBlockers(draft.blockers);
   const problem = taskDetail.querySelector("[data-spec-problem]");
   if (problem) {
@@ -3299,6 +3378,8 @@ export function mountTasks() {
       markWriting();
     }
     if (ev.target.matches("[data-spec]") && drawnIsOpen() && specEditOn(shownTask)) {
+      // Here, before the browser scrolls to the caret, so the field has its new height.
+      if (ev.target.matches('textarea[data-spec="body"]')) drawMirror(ev.target);
       specEdit.draft = { ...specEdit.draft, [ev.target.dataset.spec]: ev.target.value };
       markWriting();
     }

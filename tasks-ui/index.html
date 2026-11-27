@@ -186,7 +186,8 @@
     background: #202632; color: var(--fg); border: 1px solid var(--line);
     border-radius: 6px; padding: 5px 8px; resize: vertical; }
   /* A task's spec as a form, in place of the lines that show it: each control as wide
-     as the detail, and under the title and body what will be stored, spelled. While
+     as the detail, and under the title, and under the body's save row, what will be
+     stored, spelled. While
      it is open, a line one high above the moves says when the edit holds them, so
      saying it moves no button. */
   .spec-form { margin: 8px 0; padding: 8px; border: 1px solid var(--line);
@@ -195,8 +196,45 @@
     font-size: 13px; background: #202632; color: var(--fg); border: 1px solid var(--line);
     border-radius: 6px; padding: 5px 8px; }
   .spec-form input[type="text"], .spec-form textarea { width: 100%; }
-  .spec-form textarea { resize: vertical; }
   .spec-form .moves button { font-size: 12px; padding: 4px 10px; }
+  /* The body's field (bodyField in tasks.js): its textarea over a mirror of its text in
+     one grid cell. The mirror is in flow and sizes the cell, so the textarea, stretched
+     to it, is as tall as its text, at least its 10 rows, and never scrolls itself: the
+     page does. Both take this one rule for their box, font and wrapping, and the
+     mirror's runs differ by colour alone, never weight, style or size, so each glyph
+     is as wide in both and the lines break alike. The textarea draws only the caret
+     and the selection over the mirror's colours, and only once the mirror holds its
+     text (`mirrored`). */
+  .spec-field { display: grid; }
+  .spec-form .spec-field > :is(textarea, .spec-mirror) { grid-area: 1 / 1; min-width: 0;
+    width: 100%; margin: 0; font: inherit; font-size: 13px; padding: 5px 8px;
+    border: 1px solid var(--line); border-radius: 6px; white-space: pre-wrap;
+    overflow-wrap: break-word; word-break: normal; tab-size: 8; letter-spacing: normal;
+    word-spacing: normal; text-align: start; text-indent: 0; }
+  .spec-form .spec-field > .spec-mirror { background: #202632; color: var(--fg); }
+  .spec-form .spec-field > textarea { background: transparent; align-self: stretch;
+    height: auto; overflow: hidden; resize: none; caret-color: var(--fg); }
+  .spec-form .spec-field.mirrored > textarea { color: transparent; }
+  .spec-form .spec-field.mirrored > textarea::selection { color: transparent;
+    background: rgba(59, 130, 246, .4); }
+  .hl-heading { color: #79c0ff; }
+  .hl-strong { color: #ffa657; }
+  .hl-em { color: #d2a8ff; }
+  .hl-code { color: #7ee787; }
+  .hl-marker { color: var(--hold); }
+  .hl-quote { color: #56d4dd; }
+  .hl-source { color: var(--dim); }
+  /* Forced colours draw neither layer's colours, and force the textarea's transparent
+     text to the system's: the textarea draws its text, and the mirror only sizes the
+     cell. */
+  @media (forced-colors: active) {
+    .spec-form .spec-field > .spec-mirror { visibility: hidden; }
+  }
+  /* While the form is open, a caret moved up stops under the strip and the notice slot,
+     which stick atop the page (44 px and 28), rather than behind them; the controls
+     inside that band take it back, so focusing one scrolls nothing. */
+  html:has(.spec-form) { scroll-padding-top: 72px; }
+  html:has(.spec-form) :is(#task-back, .notice-slot button) { scroll-margin-top: -72px; }
   .spec-preview { margin: 2px 0 8px; }
   .held-line { height: 22px; white-space: nowrap; overflow: hidden;
     text-overflow: ellipsis; font-size: 12px; }

@@ -1945,12 +1945,31 @@ const shapes = {
   items: rep("- a\n", N),
 };
 const timing = {};
+const highlightTiming = {};
+const lit = s => md.highlightRuns(s).map(r => r.text).join("");
 for (const [name, s] of Object.entries(shapes)) {
-  const start = performance.now();
+  let start = performance.now();
   const ok = joined(s) === s;
   timing[name] = { ms: performance.now() - start, lossless: ok, length: s.length };
+  start = performance.now();
+  const lit_ok = lit(s) === s;
+  highlightTiming[name] = { ms: performance.now() - start, lossless: lit_ok,
+                            length: s.length };
 }
+const highlights = JSON.parse(process.env.DOCKADE_HL_CASES);
+// Runs merge their neighbours of one class, and none is empty.
+const merged = s => md.highlightRuns(s).every(
+  (r, k, all) => r.text && (k === 0 || all[k - 1].cls !== r.cls));
 console.log(JSON.stringify({
+  highlighted: Object.fromEntries(Object.entries(highlights).map(
+    ([k, s]) => [k, md.highlightRuns(s).map(r => [r.cls, r.text])])),
+  highlight_lossless: Object.values(cases).concat(Object.values(highlights), fuzz)
+    .filter(s => lit(s) !== s),
+  highlight_unmerged: Object.values(cases).concat(Object.values(highlights), fuzz)
+    .filter(s => !merged(s)),
+  highlight_missing: [md.highlightRuns(undefined), md.highlightRuns(null),
+                      md.highlightRuns(7)],
+  highlightTiming,
   parsed: Object.fromEntries(Object.entries(cases).map(([k, s]) => [k, parsed(s)])),
   lossless: Object.values(cases).concat(fuzz).filter(s => joined(s) !== s),
   nested: Object.values(cases).concat(fuzz).filter(s => !nests(s)),
@@ -2065,12 +2084,32 @@ _MD = {
     "nest_17": "*a " * 17 + "a* " * 17,
 }
 
+# Texts the spec editor's highlighter colours, by name; each case's runs, as [class,
+# text], are in the test that names it.
+_HL = {
+    "heading": "## Head *em* `c`\nnext",
+    "item": "- a **b** c\n12. d\n  * e",
+    "spans": "x *em* **strong** `code` y",
+    "strong_em": "***a*** _b **c** d_",
+    "fence": "```py\n> not a quote **x**\n```\nafter",
+    "quote": "> q **bold** `c`\n   > three\n    > four",
+    "quote_in_item": "- a\n> q",
+    "source": "a [l](u) <b>x</b> &amp; \\* <!-- c -->",
+    "table": "| a | b |",
+    "html": "<script>alert(1)</script>\n<img src=x onerror=alert(1)>",
+    "crlf": "# h\r\n- i\r\n*e*\r\n",
+    "lone_cr": "a\r# not a heading",
+    "hidden": "a\u202e *b\u200b* c\u2028d",
+    "unmatched": "*a **b",
+    "em_lines": "*a\nb* c",
+}
+
 
 @unittest.skipIf(not _NODE and not _STRICT,
                  "node is not installed — skipping app.js unit tests")
 class MarkdownTests(unittest.TestCase):
     """``markdown.js``, the tokenizer the detail draws agent markdown from and the spec
-    editor's highlighter may share: lossless, the subset and no more, emphasis stricter
+    editor's highlighter shares: lossless, the subset and no more, emphasis stricter
     than CommonMark's so paths and globs stay as written, and linear on hostile text."""
 
     probe: dict
@@ -2080,7 +2119,8 @@ class MarkdownTests(unittest.TestCase):
         proc = subprocess.run(  # noqa: S603 (absolute path, fixed args, as _probe)
             [_NODE, "--input-type=module", "-e", _MARKDOWN_PROBE],
             env={**os.environ, "DOCKADE_UI_DIR": str(_served_dir(TASKS_DIR)),
-                 "DOCKADE_MD_CASES": json.dumps(_MD)},
+                 "DOCKADE_MD_CASES": json.dumps(_MD),
+                 "DOCKADE_HL_CASES": json.dumps(_HL)},
             capture_output=True, text=True, timeout=120, check=False)
         if proc.returncode != 0:
             raise AssertionError("importing markdown.js under node failed:\n" + proc.stderr)
@@ -2309,6 +2349,74 @@ class MarkdownTests(unittest.TestCase):
                 # The outermost are the ones kept.
                 self.assertEqual(tokens[0], ["em-open", "*"])
                 self.assertEqual(tokens[-2], ["em-close", "*"])
+
+    def runs(self, name: str) -> list:
+        return self.probe["highlighted"][name]
+
+    def test_the_highlighters_runs_joined_are_the_text_exactly(self):
+        self.assertEqual(self.probe["highlight_lossless"], [])
+        self.assertEqual(self.probe["highlight_unmerged"], [])
+        self.assertEqual(self.probe["highlight_missing"], [[], [], []])
+        for name, text in _HL.items():
+            with self.subTest(case=name):
+                self.assertEqual("".join(t for _, t in self.runs(name)), text)
+
+    def test_the_highlighter_colours_each_construct_by_what_the_detail_draws(self):
+        # A heading's line whole, its spans included; its line end plain.
+        self.assertEqual(self.runs("heading"), [
+            ["heading", "## Head *em* `c`"], ["", "\nnext"]])
+        # An item's bullet or number, not its indent.
+        self.assertEqual(self.runs("item"), [
+            ["marker", "- "], ["", "a "], ["strong", "**b**"], ["", " c\n"],
+            ["marker", "12."], ["", " d\n  "], ["marker", "* "], ["", "e"]])
+        self.assertEqual(self.runs("spans"), [
+            ["", "x "], ["em", "*em*"], ["", " "], ["strong", "**strong**"], ["", " "],
+            ["code", "`code`"], ["", " y"]])
+        # The innermost span's class, a delimiter taking the span it opens or closes.
+        self.assertEqual(self.runs("strong_em"), [
+            ["em", "*"], ["strong", "**a**"], ["em", "*"], ["", " "], ["em", "_b "],
+            ["strong", "**c**"], ["em", " d_"]])
+        self.assertEqual(self.runs("fence"), [
+            ["code", "```py"], ["", "\n"], ["code", "> not a quote **x**"], ["", "\n"],
+            ["code", "```"], ["", "\nafter"]])
+        self.assertEqual(self.runs("unmatched"), [["", "*a **b"]])
+        # A line end inside a span is the span's.
+        self.assertEqual(self.runs("em_lines"), [["em", "*a\nb*"], ["", " c"]])
+
+    def test_a_quote_line_is_a_quote_whole_and_only_as_the_tokenizer_reads_one(self):
+        # Bold and code inside it are the quote's, as the detail draws it as typed; up
+        # to three spaces before its `>`, and at four it is indented code, source.
+        self.assertEqual(self.runs("quote"), [
+            ["quote", "> q **bold** `c`"], ["", "\n"], ["quote", "   > three"],
+            ["", "\n"], ["source", "    > four"]])
+        self.assertEqual(self.runs("quote_in_item"), [
+            ["marker", "- "], ["", "a\n"], ["quote", "> q"]])
+        self.assertEqual(self.runs("table"), [["source", "| a | b |"]])
+
+    def test_every_other_construct_is_source_and_html_is_only_text(self):
+        self.assertEqual(self.runs("source"), [
+            ["", "a "], ["source", "[l](u)"], ["", " "], ["source", "<b>"], ["", "x"],
+            ["source", "</b>"], ["", " "], ["source", "&amp;"], ["", " "],
+            ["source", "\\*"], ["", " "], ["source", "<!-- c -->"]])
+        self.assertEqual(self.runs("html"), [
+            ["source", "<script>alert(1)</script>"], ["", "\n"],
+            ["source", "<img src=x onerror=alert(1)>"]])
+
+    def test_line_ends_and_hidden_characters_are_kept_as_typed(self):
+        self.assertEqual(self.runs("crlf"), [
+            ["heading", "# h"], ["", "\r\n"], ["marker", "- "], ["", "i\r\n"],
+            ["em", "*e*"], ["", "\r\n"]])
+        self.assertEqual(self.runs("lone_cr"), [["", _HL["lone_cr"]]])
+        # Not spelled: the mirror holds what the textarea holds.
+        self.assertEqual(self.runs("hidden"), [
+            ["", "a\u202e "], ["em", "*b\u200b*"], ["", " c\u2028d"]])
+
+    def test_the_highlighter_takes_linear_time_on_hostile_shapes(self):
+        for name, t in self.probe["highlightTiming"].items():
+            with self.subTest(shape=name):
+                self.assertTrue(t["lossless"])
+                self.assertGreater(t["length"], 99_000)
+                self.assertLess(t["ms"], 1000)
 
     def test_markdown_js_imports_nothing_and_draws_nothing(self):
         src = (TASKS_DIR / "markdown.js").read_text()
@@ -3138,8 +3246,19 @@ class TaskRenderingSourceTests(unittest.TestCase):
     def test_the_guards_read_every_module_the_page_serves(self):
         self.assertEqual(set(self.MODULES), set(tui.UI_MODULES))
 
+    # The one exemption, two lines of `drawMirror`, whose comment says why; held to
+    # setting text by `test_the_mirror_alone_draws_agent_text_unspelled_and_only_as_text`.
+    UNSPELLED = "drawMirror"
+    UNSPELLED_LINES = ("if (!run.cls) return document.createTextNode(run.text);",
+                       "span.textContent = run.text;")
+
     def test_every_agent_field_goes_through_the_spelling(self):
         code = "\n".join(_code(src) for src in self.MODULES.values())
+        mirror = _code(_function(self.TASKS, self.UNSPELLED))
+        self.assertEqual(code.count(mirror), 1)
+        kept = "\n".join(ln for ln in mirror.splitlines()
+                         if ln.strip() not in self.UNSPELLED_LINES)
+        code = code.replace(mirror, kept)
         lines = [ln for ln in code.splitlines() if self.FIELD.search(ln)]
         self.assertGreater(len(lines), 10, "the field pattern found too little")
         for ln in lines:
@@ -3147,6 +3266,76 @@ class TaskRenderingSourceTests(unittest.TestCase):
                 continue        # a condition reads the field; it draws nothing
             with self.subTest(line=ln.strip()):
                 self.assertTrue(any(s in ln for s in self.SPELT), ln)
+
+    def test_the_mirror_alone_draws_agent_text_unspelled_and_only_as_text(self):
+        mirror = _function(self.TASKS, self.UNSPELLED)
+        code = _code(mirror)
+        # Each run a text node or a span it names, its text set as text.
+        self.assertEqual(re.findall(r"document\.createElement\(([^)]*)\)", code),
+                         ['"span"'])
+        self.assertEqual(re.findall(r"\brun\.text\b[^;]*;", code),
+                         ["run.text);", "run.text;"])
+        self.assertEqual([ln.strip() for ln in code.splitlines() if self.FIELD.search(ln)],
+                         list(self.UNSPELLED_LINES))
+        # It draws the textarea's value and nothing else: no read of a task, and no
+        # write but these.
+        self.assertNotRegex(code, r"\b(?:specEdit|shownTask|task|base|draft)\b")
+        self.assertEqual(re.findall(r"^\s*((?:const |let )?[\w.]+) = ", code, re.M), [
+            "const field", "const mirror", "const value", "const nodes", "const span",
+            "span.className", "span.textContent"])
+        self.assertIn("if (!run.cls) return document.createTextNode(run.text);", code)
+        self.assertIn("span.textContent = run.text;", code)
+        self.assertIn("span.className = `hl-${run.cls}`;", code)
+        self.assertIn("const nodes = highlightRuns(value).map(run => {", code)
+        self.assertIn("document.createTextNode(value + MIRROR_SENTINEL)", code)
+        self.assertIn('const MIRROR_SENTINEL = "\\u200b";', self.TASKS)
+        self.assertNotRegex(code, r"\.(?:innerHTML|outerHTML|insertAdjacentHTML|"
+                                  r"setHTML\w*|srcdoc)\b|createContextualFragment")
+        # Its text drawn over only once the mirror holds it: the class goes before the
+        # highlighter runs and comes back after the mirror is filled.
+        self.assertLess(code.index('field.classList.remove("mirrored");'),
+                        code.index("highlightRuns(value)"))
+        self.assertLess(code.index("mirror.replaceChildren(...nodes, "),
+                        code.index('field.classList.add("mirrored");'))
+        self.assertEqual(code.count('classList.add("mirrored")'), 1)
+        # Hidden from assistive technology: the textarea is what it reads.
+        self.assertIn('mirror.setAttribute("aria-hidden", "true");',
+                      _function(self.TASKS, "bodyField"))
+        # Drawn on every draw of the form, and on each input before anything else.
+        self.assertIn("field.append(mirror, box);\n  drawMirror(box);",
+                      _function(self.TASKS, "bodyField"))
+        self.assertIn("if (ev.target.matches('textarea[data-spec=\"body\"]')) "
+                      "drawMirror(ev.target);\n"
+                      "      specEdit.draft = ", self.TASKS)
+
+    def test_the_mirrors_runs_differ_by_colour_alone(self):
+        # Weight, style or size would widen glyphs in the mirror and not in the
+        # textarea, so lines would break apart: the browser tests see that only when a
+        # line is near the edge.
+        html = (TASKS_DIR / "index.html").read_text()
+        rules = re.findall(r"^\s*\.hl-([a-z]+) \{([^}]*)\}", html, re.M)
+        self.assertEqual(sorted(name for name, _ in rules), [
+            "code", "em", "heading", "marker", "quote", "source", "strong"])
+        for name, body in rules:
+            with self.subTest(rule=name):
+                self.assertRegex(body, r"^ color: [^;]+; $")
+        self.assertEqual(len(re.findall(r"\.hl-", html)), len(rules))
+
+    def test_the_body_is_the_forms_last_field_with_save_under_it(self):
+        form = _function(self.TASKS, "specForm")
+        order = ['line("title", specControl("title")), specPreviewSlot("title")',
+                 'line("severity", specControl("severity"))',
+                 'line("blocked by", specControl("blockers"))',
+                 'line("body", bodyField())',
+                 "row.append(save, discard);",
+                 "saving.append(row, count);",
+                 'form.append(saving, specPreviewSlot("body"));']
+        at = [form.index(s) for s in order]
+        self.assertEqual(at, sorted(at))
+        self.assertEqual(form.count("specPreviewSlot("), 2)
+        self.assertIn('count.className = "held-line warn";', form)
+        self.assertIn("if (count) count.textContent = storedCount(base, draft);",
+                      _function(self.TASKS, "markEdit"))
 
     def test_the_plans_are_drawn_against_what_they_are(self):
         # The task's own plan is read against its state and drawn as what changed from
@@ -3756,6 +3945,15 @@ console.log(JSON.stringify({
     title: t.specPreview(base, {...draft, title: "Keys, rotated"}, "title"),
     one: t.specPreview({...base, body: "a\r\nb"}, {...draft, body: "x"}, "body"),
   },
+  count: {
+    untouched: t.storedCount(base, draft),
+    sent: t.storedCount(base, {...draft, body: "One.\nTwo.\nThree.\u200b"}),
+    one: t.storedCount({...base, body: "a\r\nb"}, {...draft, body: "x"}),
+    clean: t.storedCount({...base, body: "Plain."}, {...draft, body: "Plain."}),
+    // The title's preview sits above save, under its own control: not counted here.
+    title: t.storedCount({...base, body: "Plain."},
+                         {...draft, body: "Plain.", title: "Keys\u200b"}),
+  },
   rebase_text: {
     taken: t.rebaseText(4, 6, ["title"], [], false),
     kept: t.rebaseText(4, 6, ["title", "body"], ["body"], false),
@@ -3949,6 +4147,16 @@ class EditTests(unittest.TestCase):
         self.assertEqual(p["one"]["lost"], "1 line break of the stored body turned into "
                                            "line feeds by this control.")
 
+    def test_the_line_beside_save_counts_what_the_bodys_preview_shows(self):
+        # Save sits above the body's preview: this line says when there is something
+        # in it to read, and is empty when there is not.
+        self.assertEqual(self.probe["count"], {
+            "untouched": "The body's preview below shows 2 hidden characters.",
+            "sent": "The body's preview below shows 1 hidden character and 2 line breaks "
+                    "turned into line feeds.",
+            "one": "The body's preview below shows 1 line break turned into line feeds.",
+            "clean": "", "title": ""})
+
     def test_a_rebase_says_what_moved_and_what_saving_writes_over(self):
         t = self.probe["rebase_text"]
         self.assertEqual(t["taken"], "The task moved from revision 4 to 6 while you "
@@ -4062,8 +4270,11 @@ class TaskEditSourceTests(unittest.TestCase):
         self.assertIn("[ev.target.dataset.spec]: ev.target.value", self.TASKS)
 
     def test_the_preview_is_spelled_and_set_as_text(self):
-        self.assertIn("const shown = spellHidden(sent ? draft[field] : stored);",
-                      _function(self.TASKS, "specPreview"))
+        self.assertIn("return { sent, shown: spellHidden(sent ? draft[field] : stored),",
+                      _function(self.TASKS, "storedAs"))
+        for name in ("specPreview", "storedCount"):
+            with self.subTest(function=name):
+                self.assertIn("= storedAs(base, draft, ", _function(self.TASKS, name))
         mark = _function(self.TASKS, "markEdit")
         self.assertIn("text.textContent = preview.text;", mark)
         self.assertIn("hiddenNote(preview.hidden)", mark)

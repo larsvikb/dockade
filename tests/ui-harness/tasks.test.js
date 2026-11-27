@@ -15,6 +15,8 @@ import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
 import * as backend from "./tasks-backend.js";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { BROWSER, ORIGIN, launch, openPage } from "./page.js";
 
 const uiDir = process.argv[2];
@@ -1170,4 +1172,314 @@ test("a double-click's second click opens no related task", TIMEOUT, async t => 
   await p.settle();
   assert.equal((await p.state()).hash, "#task=1");
   assert.deepEqual(p.reads, ["3", "1"]);
+});
+
+// ── the spec editor ─────────────────────────────────────────────────────────
+
+// A task's spec edit opened, task 20's unless given: a body of thousands of characters
+// with numbered points, bold lead-ins, quotes, text that looks like HTML and a hidden
+// character (tasks-backend.js). `offOrigin` is every request the page makes off its
+// origin from then, which a drawn `<img>` would add.
+async function specEdit(t, { viewport = { width: 1280, height: 900 }, id = 20 } = {}) {
+  const p = await tasksPage(t, { viewport, hash: `#task=${id}` });
+  const offOrigin = [];
+  p.page.on("request", r => {
+    if (new URL(r.url()).origin !== ORIGIN) offOrigin.push(r.url());
+  });
+  await p.click("#task-detail button[data-spec-open]");
+  return { ...p, offOrigin, body: p.page.locator('#task-detail textarea[data-spec="body"]') };
+}
+
+// The body's two layers: what the mirror is made of and holds, and the textarea's
+// content height, read with the textarea set to height 0 so its scrollHeight is its
+// text's and not the box it is stretched to, beside the mirror's box less its border.
+function layers(page) {
+  return page.evaluate(() => {
+    const box = document.querySelector('#task-detail textarea[data-spec="body"]');
+    const mirror = document.querySelector("#task-detail [data-spec-mirror]");
+    const kept = box.style.height;
+    box.style.height = "0px";
+    const content = box.scrollHeight;
+    box.style.height = kept;
+    return {
+      kinds: [...new Set([...mirror.childNodes].map(n => n.nodeName))].sort(),
+      // Spans holding anything but text.
+      nested: [...mirror.children].filter(s => s.childNodes.length !== 1
+                                          || s.firstChild.nodeType !== Node.TEXT_NODE)
+        .length,
+      classes: [...new Set([...mirror.children].map(s => s.className))].sort(),
+      runs: [...mirror.children].map(s => [s.className, s.textContent]),
+      text: mirror.textContent,
+      value: box.value,
+      content,
+      mirror: mirror.clientHeight,
+      heights: [box.offsetHeight, mirror.offsetHeight],
+      scrollTop: box.scrollTop,
+      hidden: mirror.getAttribute("aria-hidden"),
+      mirrored: box.parentElement.classList.contains("mirrored"),
+      color: getComputedStyle(box).color,
+      // A scrollbar would narrow the textarea's text and not the mirror's; headless
+      // Chromium draws none, so the style is read rather than the lines.
+      overflow: getComputedStyle(box).overflowY,
+      // An opaque textarea would cover the mirror; a transparent caret would be lost.
+      background: getComputedStyle(box).backgroundColor,
+      caret: getComputedStyle(box).caretColor,
+      // Wider than the form, a long unbroken word would widen both layers past it.
+      widths: [Math.max(box.offsetWidth, mirror.offsetWidth),
+               box.closest("[data-spec-form]").clientWidth],
+      visibility: getComputedStyle(mirror).visibility,
+    };
+  });
+}
+
+const SENTINEL = "\u200b";
+const TRANSPARENT = "rgba(0, 0, 0, 0)";
+
+// What every draw of the field holds: a mirror of spans and text only, holding the
+// value and the sentinel, as tall as the textarea's text; the textarea as tall as the
+// mirror, and never scrolled.
+function assertLinedUp(l, why) {
+  assert.deepEqual(l.kinds.filter(k => k !== "#text" && k !== "SPAN"), [], why);
+  assert.equal(l.nested, 0, why);
+  assert.equal(l.text, l.value + SENTINEL, why);
+  assert.equal(l.content, l.mirror, why);
+  assert.equal(l.heights[0], l.heights[1], why);
+  assert.equal(l.scrollTop, 0, why);
+  assert.equal(l.overflow, "hidden", why);
+  assert.ok(l.widths[0] <= l.widths[1], `${why}: the field is ${l.widths[0]} px wide in `
+            + `a form ${l.widths[1]} px wide`);
+  if (l.mirrored) {
+    assert.equal(l.background, TRANSPARENT, why);
+    assert.notEqual(l.caret, TRANSPARENT, why);
+  }
+}
+
+for (const viewport of [{ width: 1280, height: 900 }, PHONE]) {
+  test(`${viewport.width} px: the body's field grows with its text, lined up with a `
+       + "mirror that draws agent text as text", TIMEOUT, async t => {
+    const p = await specEdit(t, { viewport });
+    let l = await layers(p.page);
+    assertLinedUp(l, "as drawn");
+    assert.equal(l.value, backend.LONG_BODY);
+    assert.ok(l.content > viewport.height,
+              `the field is ${l.content} px high: it does not grow`);
+    assert.equal(l.hidden, "true");
+    assert.equal(l.mirrored, true);
+    assert.equal(l.color, TRANSPARENT);
+    // Text that looks like markup is runs' text; the hidden character is as typed.
+    const at = l.runs.findIndex(([cls, s]) => cls === "hl-source" && s === "<script>");
+    assert.deepEqual(l.runs.slice(at, at + 3), [
+      ["hl-source", "<script>"], ["hl-source", "</script>"],
+      ["hl-source", '<img src=x onerror="alert(1)">']]);
+    assert.ok(l.text.includes("<script>alert(1)</script> and <img src=x onerror="));
+    assert.ok(l.text.includes("hidden\u200b character"));
+    assert.ok(l.runs.some(([cls, s]) => cls === "hl-strong" && s === "**Point 3.**"));
+    assert.ok(l.runs.some(([cls, s]) => cls === "hl-quote" && s.startsWith("> Note 3:")));
+    assert.deepEqual(l.classes, ["hl-code", "hl-em", "hl-heading", "hl-marker",
+                                 "hl-quote", "hl-source", "hl-strong"]);
+    // Typed at the end, ending in a line end, which only the sentinel gives a height.
+    await p.body.click();
+    await p.page.keyboard.press("Control+End");
+    await p.page.keyboard.type(" **x**");
+    await p.page.keyboard.press("Enter");
+    await p.settle();
+    l = await layers(p.page);
+    assertLinedUp(l, "after typing");
+    assert.ok(l.value.endsWith("page. **x**\n"));
+    assert.deepEqual(l.runs.at(-1), ["hl-strong", "**x**"]);
+    assert.deepEqual(p.offOrigin, []);
+    assert.deepEqual(p.errors, []);
+  });
+}
+
+test("undo restores the text and its mirror together", TIMEOUT, async t => {
+  const p = await specEdit(t);
+  await p.body.click();
+  await p.page.keyboard.press("Control+End");
+  await p.page.keyboard.type(" **x**");
+  await p.settle();
+  assert.notEqual(await p.body.inputValue(), backend.LONG_BODY);
+  for (let i = 0; i < 10 && (await p.body.inputValue()) !== backend.LONG_BODY; i++) {
+    await p.page.keyboard.press("Control+z");
+    await p.settle();
+    assertLinedUp(await layers(p.page), `undo ${i}`);
+  }
+  const l = await layers(p.page);
+  assert.equal(l.value, backend.LONG_BODY);
+  assert.equal(l.text, backend.LONG_BODY + SENTINEL);
+});
+
+test("a rebase redraws the mirror from the draft it moved onto", TIMEOUT, async t => {
+  const p = await specEdit(t);
+  await p.page.fill('#task-detail input[data-spec="title"]', "Long spec, kept");
+  await p.settle();
+  backend.editElsewhere(20);
+  await p.poll();
+  await p.click("#task-detail button[data-show]");
+  const l = await layers(p.page);
+  assertLinedUp(l, "rebased");
+  assert.equal(l.value, `${backend.LONG_BODY}\nEdited elsewhere.`);
+  assert.equal(await p.page.inputValue('#task-detail input[data-spec="title"]'),
+               "Long spec, kept");
+});
+
+test("under forced colours the textarea draws its own text, over a mirror that only "
+     + "sizes it", TIMEOUT, async t => {
+  const p = await specEdit(t);
+  await p.page.emulateMedia({ forcedColors: "active" });
+  const l = await layers(p.page);
+  assert.notEqual(l.color, TRANSPARENT);
+  assert.equal(l.visibility, "hidden");
+  assert.equal(l.content, l.mirror);
+});
+
+test("a highlighter that throws on a later input leaves the textarea's text drawn",
+     TIMEOUT, async t => {
+  const p = await specEdit(t);
+  // markdown.js as served, but its highlighter throws on a text holding "zzz".
+  const source = await readFile(path.join(uiDir, "markdown.js"), "utf8");
+  const broken = source.replace(
+    "export function highlightRuns(text) {",
+    "export function highlightRuns(text) {\n"
+      + '  if (String(text).includes("zzz")) throw new Error("broken highlighter");\n'
+      + "  return realRuns(text);\n}\nfunction realRuns(text) {");
+  assert.notEqual(broken, source);
+  await p.page.route("**/markdown.js", route => route.fulfill({
+    contentType: "text/javascript", body: broken }));
+  await p.helpers.navigate(() => p.page.reload());
+  await p.settle();
+  await p.click("#task-detail button[data-spec-open]");
+  let l = await layers(p.page);
+  assert.equal(l.mirrored, true);
+  assert.equal(l.color, TRANSPARENT);
+  await p.body.click();
+  await p.page.keyboard.press("Control+End");
+  await p.page.keyboard.type(" zzz");
+  await p.settle();
+  l = await layers(p.page);
+  assert.equal(l.mirrored, false);
+  assert.notEqual(l.color, TRANSPARENT);
+  assert.equal(l.text, l.value + SENTINEL);
+  assert.equal(l.content, l.mirror);
+});
+
+test("a short body's field is still ten rows high", TIMEOUT, async t => {
+  const p = await specEdit(t, { id: 11 });
+  const rows = await p.body.evaluate(box => {
+    const s = getComputedStyle(box);
+    return (box.clientHeight - parseFloat(s.paddingTop) - parseFloat(s.paddingBottom))
+      / parseFloat(s.lineHeight);
+  });
+  assert.ok(rows >= 10, `${rows} rows`);
+  const l = await layers(p.page);
+  assert.equal(l.heights[0], l.heights[1]);
+});
+
+// Where the caret's line is in the window, read off the mirror, which draws the same
+// text in the same place: the middle of the character after the caret, or before it at
+// the text's end; and whether the textarea is what is drawn there.
+function caretLine(page) {
+  return page.evaluate(() => {
+    const box = document.querySelector('#task-detail textarea[data-spec="body"]');
+    const mirror = document.querySelector("#task-detail [data-spec-mirror]");
+    let at = box.selectionStart;
+    const walker = document.createTreeWalker(mirror, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (at >= node.data.length && walker.nextNode()) {
+      at -= node.data.length;
+      node = walker.currentNode;
+    }
+    const range = document.createRange();
+    const from = Math.min(at, node.data.length - 1);
+    range.setStart(node, from);
+    range.setEnd(node, from + 1);
+    const r = range.getClientRects()[0];
+    const y = (r.top + r.bottom) / 2;
+    const hit = document.elementFromPoint(box.getBoundingClientRect().left + 12, y);
+    return { y, onTextarea: hit === box };
+  });
+}
+
+test("a caret moved up stays out from under the bands atop the page", TIMEOUT,
+     async t => {
+  const p = await specEdit(t);
+  // The slot filled, so it sticks under the strip.
+  backend.editElsewhere(20);
+  await p.poll();
+  await p.body.click();
+  await p.page.keyboard.press("Control+End");
+  for (let i = 0; i < 60; i++) {
+    await p.page.keyboard.press("ArrowUp");
+    const c = await caretLine(p.page);
+    assert.ok(c.onTextarea, `${i + 1} lines up, at y ${c.y}`);
+  }
+  await p.page.keyboard.press("Control+End");
+  await p.page.keyboard.press("Control+Home");
+  const c = await caretLine(p.page);
+  assert.ok(c.onTextarea, `the first line, at y ${c.y}`);
+});
+
+test("focusing a control in the bands atop the page scrolls nothing", TIMEOUT,
+     async t => {
+  const p = await specEdit(t);
+  backend.editElsewhere(20);
+  await p.poll();
+  const y = await p.scrollTo(1200);
+  assert.equal(y, 1200);
+  await p.page.locator("#task-detail h3 button.source-toggle")
+    .evaluate(b => b.focus({ preventScroll: true }));
+  await p.page.keyboard.press("Shift+Tab");
+  assert.equal(await p.page.evaluate(() => document.activeElement.dataset.show), "1");
+  assert.equal(await p.page.evaluate(() => window.scrollY), y);
+  await p.page.keyboard.press("Shift+Tab");
+  assert.equal(await p.page.evaluate(() => document.activeElement.id), "task-back");
+  assert.equal(await p.page.evaluate(() => window.scrollY), y);
+});
+
+test("save and discard follow the body and precede its preview", TIMEOUT, async t => {
+  const p = await specEdit(t);
+  const order = await p.page.evaluate(() => {
+    const at = sel => document.querySelector(`#task-detail ${sel}`);
+    const before = (a, b) => Boolean(
+      at(a).compareDocumentPosition(at(b)) & Node.DOCUMENT_POSITION_FOLLOWING);
+    return [before('input[data-spec="blockers"]', 'textarea[data-spec="body"]'),
+            before('textarea[data-spec="body"]', 'button[data-write="edit"]'),
+            before('button[data-write="edit"]', "button[data-spec-discard]"),
+            before("button[data-spec-discard]", '[data-spec-preview="body"]')];
+  });
+  assert.deepEqual(order, [true, true, true, true]);
+});
+
+test("390 px: the count beside save moves neither button, and names the hidden "
+     + "character", TIMEOUT, async t => {
+  const p = await specEdit(t, { viewport: PHONE, id: 11 });
+  const saving = () => p.page.evaluate(() => {
+    const at = sel => document.querySelector(`#task-detail ${sel}`);
+    const box = sel => {
+      const r = at(sel).getBoundingClientRect();
+      return [r.left, r.top + window.scrollY, r.width, r.height];
+    };
+    return { row: box("[data-spec-save]"), save: box('button[data-write="edit"]'),
+             discard: box("button[data-spec-discard]"),
+             count: at("[data-spec-count]").textContent };
+  });
+  const before = await saving();
+  assert.equal(before.count, "");
+  await p.body.click();
+  await p.page.keyboard.press("Control+End");
+  await p.page.keyboard.insertText("\u200b");
+  await p.settle();
+  const after = await saving();
+  assert.equal(after.count, "The body's preview below shows 1 hidden character.");
+  assert.deepEqual({ ...after, count: "" }, before);
+});
+
+test("leaving an open edit leaves the list no scroll padding", TIMEOUT, async t => {
+  const p = await specEdit(t);
+  const padding = () => p.page.evaluate(
+    () => getComputedStyle(document.documentElement).scrollPaddingTop);
+  assert.equal(await padding(), "72px");
+  await p.click("#task-back");
+  assert.equal((await p.state()).list, true);
+  assert.equal(await padding(), "auto");
 });

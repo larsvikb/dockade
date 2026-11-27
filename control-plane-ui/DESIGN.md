@@ -290,7 +290,11 @@ rows, and the good read that clears the warning; and the decisions' outage line 
 rows: the fail-closed denial's row marked in the folded view and in the record, and the
 line counting its requests, gone on a record page that has none. For tool rules the
 good read is tested only after a failed refresh, as with nothing loaded there is no
-revoke to trigger one.
+revoke to trigger one. The same file drives the desktop notification against a faked
+`Notification`: none for the holds the first push delivers or while the Approvals view
+is on screen, one per arrival after it, a notice closed when its hold leaves however it
+left, the button's label for each permission and outside a secure context, and a
+constructor that throws latching it off.
 In `make test` `start()`'s DOM path has only the guards above and the free-name check
 below. Mutation testing is what showed the gap: every mutation in a pure helper was caught and every one inside `start()` survived.
 

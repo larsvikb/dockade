@@ -1,21 +1,29 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Claude Code status line for the sandbox image.
+# The status line of the Claude and agy sandbox images, one script for both.
 #
-# Wired via the baked user-settings.json template (user scope — a managed-scope
-# command status line is gated behind an approval dialog the yolo flow suppresses).
-# The script itself stays root-owned and baked here, so the non-root agent can
-# toggle the pointer but not tamper with the code it runs (see DESIGN.md
-# "the paved road"). This is a cosmetic default, not an enforced boundary.
+# Wired via each tier's baked user settings: claude-sandbox/user-settings.json
+# (user scope — a managed-scope command status line is gated behind an approval
+# dialog the yolo flow suppresses) and antigravity-sandbox/settings.json. The script
+# itself stays root-owned and baked, at /etc/claude-code/statusline.sh and
+# /etc/antigravity/statusline.sh, so the non-root agent can toggle the pointer but
+# not tamper with the code it runs (see DESIGN.md "the paved road"). This is a
+# cosmetic default, not an enforced boundary.
 #
-# Claude Code invokes this with a JSON session blob on stdin. We surface:
+# The CLI invokes this with a JSON session blob on stdin. We surface:
 #   - a sandbox indicator (this is a contained environment, always show it)
 #   - the current directory (basename)
 #   - the git branch, when inside a repo
 #   - the session id's first eight characters. The id names the session's transcript
 #     (NOTES.md, "Claude Code puts its session id in every Bash call's environment"),
 #     and a task registry records a claim's holder as `claude-` and the whole id, so
-#     this tells the operator which terminal wrote a transcript or holds a claim
+#     this tells the operator which terminal wrote a transcript or holds a claim.
+#     $DOCKADE_SESSION_ID, when set, wins over .session_id: agy-wrapper.sh exports it
+#     per agy start, it is the id agy's claims are made under (`agy-` and the id), and
+#     agy's own conversation id, which agy sends as .session_id after its first
+#     turn and empty before it, is not (NOTES.md, "agy 1.5.17's status line, before
+#     and after a turn"). Nothing sets it for Claude, whose payload id is its
+#     registry id
 #   - used context window (tokens + %)
 #   - subscription rate-limit usage: the rolling 5-hour and 7-day windows,
 #     each with a ⟳ countdown to when that window resets
@@ -31,6 +39,8 @@
 # API responses — the one endpoint the sandbox is already allowed to reach. They
 # appear only for Pro/Max sessions and only after the first API response of the
 # session, and either window can be absent, so we render each only when present.
+# agy sends no .rate_limits, before or after a turn, so for agy neither segment
+# shows; it sends a .quota object in their place, which this does not read.
 set -euo pipefail
 
 input="$(cat)"
@@ -40,7 +50,8 @@ field() { printf '%s' "$input" | jq -r "$1"; }
 cwd="$(field '.workspace.current_dir // .cwd // ""')"
 # Only the characters an agent id may hold (taskdb's pattern), so nothing else reaches
 # the terminal.
-session="$(field '.session_id // ""')"
+session="${DOCKADE_SESSION_ID:-}"
+[ -n "$session" ] || session="$(field '.session_id // ""')"
 session="${session//[^0-9A-Za-z_-]/}"
 
 dir="workspace"
@@ -65,8 +76,10 @@ fi
 # Tokens in context (input + cache reads + cache writes) and the window's size.
 # There is no current figure before the first API response (current_usage is
 # null) or after /compact until the next one (Claude Code 2.1.283 sends a total
-# of 0), so the segment is skipped in both. `numbers` keeps anything but a JSON
-# number out of the arithmetic.
+# of 0), so the segment is skipped in both. agy before its first turn sends both
+# figures as 0 and current_usage as null, so it is skipped there too; after one,
+# total_input_tokens is agy's own context figure, the one its used_percentage is
+# taken from. `numbers` keeps anything but a JSON number out of the arithmetic.
 used="$(field '.context_window | select(.current_usage != null) | .total_input_tokens | numbers | select(. > 0)')"
 ctx_limit="$(field '.context_window.context_window_size | numbers | select(. > 0)')"
 

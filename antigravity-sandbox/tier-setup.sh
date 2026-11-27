@@ -26,6 +26,9 @@ set -euo pipefail
 #       a read_file allow on /refs — the reference mounts read without an ask, as
 #         in every tier (DESIGN.md, "Reference mounts"); the mount's `:ro` is what
 #         keeps them read-only.
+#       statusLine — the status line Claude's tier shows, from the root-owned
+#         /etc/antigravity/statusline.sh (sandbox-common/statusline.sh), which
+#         makes no network call. Cosmetic, as in claude-sandbox.
 #     Every sibling shares the volume, so whichever booted last wrote the file; they
 #     all write the same one, and each writes it beside the old one and renames it
 #     over, so a sibling's agy starting at that moment reads a whole file, old or new.

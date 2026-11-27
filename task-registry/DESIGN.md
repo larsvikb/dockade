@@ -30,7 +30,7 @@ rendered from `<tier>/instructions.md`, give its own kind and variable. For Clau
 it is the session id, which also names the session's transcript, so a write leads back
 to what the session said (`NOTES.md` → "Claude Code puts its session id in every Bash
 call's environment"), and the status line shows its first eight characters
-(`claude-sandbox/statusline.sh`).
+(`sandbox-common/statusline.sh`).
 
 **Every CLI takes its id by one rule.** The kind is the CLI's command name: `claude`,
 `codex`, `agy`. The id is the CLI's own session variable, exported to the commands it

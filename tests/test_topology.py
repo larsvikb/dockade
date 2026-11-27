@@ -2960,6 +2960,19 @@ class ReffilesCoverCopySourcesTests(_MakeRun):
                 _copy_sources(f"FROM scratch\n{text}\n", "fixture", ".")
 
 
+class EgressProxyStdoutUnbufferedTests(unittest.TestCase):
+    """The egress proxy's image sets ``PYTHONUNBUFFERED=1``, the reason beside it in
+    proxies/egress/Dockerfile. Asserted rather than left to review because losing it
+    is invisible: ``make logs-ep`` goes silent, and silence reads as no traffic."""
+
+    def test_the_egress_proxy_image_sets_pythonunbuffered(self):
+        dockerfile = "proxies/egress/Dockerfile"
+        instructions = [instruction for _, instruction in
+                        _dockerfile_instructions((ROOT / dockerfile).read_text())]
+        self.assertIn("ENV PYTHONUNBUFFERED=1", instructions,
+                      f"{dockerfile} no longer has the instruction ENV PYTHONUNBUFFERED=1")
+
+
 class SecretsDirTests(_MakeRun):
     """``make secrets-dir`` makes ``MCP_SECRETS`` as the invoking user, since the
     gateway's mount will not have dockerd make it (``create_host_path: false``).

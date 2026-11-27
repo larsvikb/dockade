@@ -2042,6 +2042,37 @@ class ControlPlaneModulesAreShippedTests(unittest.TestCase):
                               f"container start")
 
 
+class ToolGatewayModulesAreShippedTests(unittest.TestCase):
+    """Every module the tool gateway's ``app.py`` sits beside is COPYed into its
+    image, for ``ControlPlaneModulesAreShippedTests``'s reason.
+
+    The gateway builds from its own directory, so its COPY sources resolve against
+    the context compose names, not the repo root; both come from compose here. The
+    Dockerfile is read through ``_copy_sources``, as the builder reads it, so a
+    commented-out COPY ships nothing and one split across lines still ships its
+    file. It is read in the test rather than on the class: ``CopyFormError`` on a
+    form the reader cannot resolve then errors this test, not the module's import."""
+
+    GW_DIR: ClassVar[Path] = ROOT / "tool-gateway"
+
+    def test_every_sibling_module_has_a_copy_line(self):
+        build = _build_of("tool-gateway")
+        context = posixpath.normpath(build["context"])
+        dockerfile = posixpath.normpath(
+            posixpath.join(context, build.get("dockerfile", "Dockerfile")))
+        shipped = set(_copy_sources((ROOT / dockerfile).read_text(), dockerfile, context))
+        modules = [p for p in sorted(self.GW_DIR.glob("*.py"))
+                   if not p.name.startswith("test_")]
+        self.assertIn("app.py", [p.name for p in modules],
+                      f"no app.py in {self.GW_DIR}: the glob would check nothing")
+        for path in modules:
+            with self.subTest(module=path.name):
+                self.assertIn(path.relative_to(ROOT).as_posix(), shipped,
+                              f"{path.name} sits next to app.py but no COPY line in "
+                              f"{dockerfile} puts it in the image — it would "
+                              f"ImportError at container start")
+
+
 class BackupToolTargetsAgreeTests(unittest.TestCase):
     """`make backup` / `make restore` reach the store through `docker run`, so the
     image, the volume and the mount path are ARGUMENTS rather than things compose

@@ -227,13 +227,43 @@ export const MD_NOTE = "## lower_case\n### Plan\nSee *this*.\n- x\n\n- y";
 const MD_TASK = { ...REFINED, id: 18, title: "Markdown one", revision: 2, body: MD_BODY,
                   plan: MD_PLAN, notes: [] };
 
+// Task 20, refined, opened only by its URL, has a body as long as the spec the operator
+// rewrote by hand: thousands of characters of numbered points with bold lead-ins,
+// quoted notes and nested items, beside text that looks like HTML, a hidden character
+// and a name far wider than a phone with nowhere to break. The spec editor's tests
+// edit it.
+const longPoint = n => [
+  `${n}. **Point ${n}.** `
+    + "The relay keeps what the page sends as it is, and the page says what it sent. "
+      .repeat(4).trim(),
+  "",
+  `> Note ${n}: a quoted note, with **bold** that the detail draws as typed.`,
+  "",
+  "   - a nested item with `code` and *emphasis*",
+  "",
+].join("\n");
+export const LONG_BODY = [
+  "## What happened",
+  "",
+  "Text that looks like markup: <script>alert(1)</script> and "
+    + `<img src=x onerror="alert(1)">, and a hidden${ZWSP} character.`,
+  "",
+  `See the ${"spec_editor_".repeat(24)}mirror setting, a name with nowhere to break.`,
+  "",
+  ...Array.from({ length: 12 }, (_, k) => longPoint(k + 1)),
+  "**Done when** the operator can make an edit like this one in the page.",
+].join("\n");
+const LONG_PLAN = { ...PLAN, id: 22, task: 20, task_revision: 3, at: NOW - 1800 };
+const LONG_TASK = { ...REFINED, id: 20, title: "Long spec", revision: 3, body: LONG_BODY,
+                    plan: LONG_PLAN, notes: [] };
+
 let PLANS = { 1: [OLDER_PLAN], 3: [APPROVED, OLDER_PLAN], 5: [APPROVED],
                 6: [PLAN, OLDER_PLAN], 8: [PLAN], 9: [DECIDED_PLANS[4]],
                 10: [DECIDED_PLANS[5]], 11: [FRESH_PLAN], 14: [DECIDED_PLANS[10]],
                 15: [DECIDED_PLANS[11]], 16: [APPROVED_PLAN],
                 17: [UNAPPROVED_PLAN, { ...PLAN, id: 3, task: 17, approved_at: NOW - 6600,
                                         superseded_at: NOW - 6500 }],
-                18: [MD_PLAN, MD_EARLIER] };
+                18: [MD_PLAN, MD_EARLIER], 20: [LONG_PLAN] };
 
 // Each task's history, oldest first, as `operator_moves.history` reads it: every write,
 // with the note it posted as it is now.
@@ -334,6 +364,7 @@ let HISTORIES = {
              { id: 40, task: 18, author: "claude-3f2a9c1e", at: NOW - 2000, text: MD_NOTE,
                for_operator: false, handled: false, hidden: false, move: null,
                reply_to: null })],
+  20: refinedHistory(NOW - 2000, LONG_PLAN),
 };
 
 function historyPage(id, params) {
@@ -406,6 +437,7 @@ let WRITTEN = { 3: { ...TASK, notes: [...TASK.notes] },
                   9: { ...DECIDED, notes: [] },
                   10: { ...SECOND_DECIDED, notes: [] },
                   11: { ...FRESH, notes: [] }, 12: { ...CRLF, notes: [] },
+                  20: { ...LONG_TASK, notes: [] },
                   5: { ...LANDING, notes: [] },
                   7: { ...PARKED, notes: [...PARKED.notes] } };
 let nextNote = 20;

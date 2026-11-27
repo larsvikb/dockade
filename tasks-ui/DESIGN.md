@@ -278,7 +278,8 @@ where it sits, with a note counting them (`spellHidden` in `tasks-ui/tasks.js`),
 because an approved body is what every later session reads, and the operator must see
 what is in it rather than what the browser draws. Between the approval page's two rules,
 the payload's, which notes non-ASCII, and the pin's, which spells it all
-(`control-plane-ui/DESIGN.md`), for that reason.
+(`control-plane-ui/DESIGN.md`), for that reason. The spec editor's mirror alone draws it
+unspelled, and why is below, with the editor.
 
 **Agent markdown is drawn, never hidden.** Agents write markdown, so the detail draws
 the body, the plan's parts but its footprint, each decision's question, why and option
@@ -301,7 +302,7 @@ field holds both forms and a class on the detail picks one, so the switch redraw
 nothing. The title, the footprint, a claim's progress, history values, the operator's
 own "other" text, the spec form's preview, a plan's diff view and the flagged list stay
 as typed, as does the export (`task-registry/export.py`). The tokenizer is lossless and
-draws nothing, so the spec editor's highlighter can share it, and linear, since an
+draws nothing, so the spec editor's highlighter shares it, and linear, since an
 agent's text is its input; it nests spans `NEST_MAX` deep at most, since the browser's
 layout costs the square of the depth.
 
@@ -350,6 +351,26 @@ once the task's revision is past the plan's, `planNotice` says approving approve
 task as it now is, with that plan, or for a plan approved before, that reopening opens
 it so: for a refined task only, since an approved task's revision always passes its
 plan's.
+
+**A long body is edited in a field as long as it, coloured as it is typed.** The operator
+rewrites specs of thousands of characters here, so the body's textarea grows to its text
+and the page scrolls, not the field: a mirror of the text, in flow in the same grid cell,
+sizes it (`bodyField` in `tasks.js`, and its rule in `index.html`). The same mirror
+colours the markdown: the textarea stays the editor, so undo, input methods, spellcheck
+and selection are the browser's, and draws only its caret and selection over the
+mirror's runs, which `highlightRuns` (`markdown.js`) reads off the detail's own
+tokenizer, so the editor colours nothing the detail would not draw. A mirror, not an
+editor library, since the page loads no third-party code. The mirror is the one place
+agent text is drawn unspelled: to line up with the textarea it must hold the characters
+the textarea holds, so it builds its runs as text, never markup, and the body's preview
+spells them (`drawMirror`). Since the page scrolls to the caret, while the form is open
+the page keeps it out from under the strip and notice line stuck atop it, by a scroll
+padding as tall as both, which the controls in that band take back, so focusing one
+scrolls nothing. Save and discard sit right under the body, not pinned to the window;
+to put them there without placing save above a field it sends, the body is the form's
+last field, and its spelled preview comes after them, so the line beside them counts
+what that preview has to show (`storedCount`) and keeps one line's height, so filling it
+moves neither button.
 
 **A revised plan is drawn as what changed.** A refiner's revision is mostly the plan it
 replaced, so a plan with a predecessor (`planPredecessor`: the next lower id, not the one
@@ -405,8 +426,10 @@ sends its writes, draws agent text and decisions, and fills the line atop the de
 `tests/test_task_registry_operator.py` that each note is on the history row that
 posted it. `make ui-test` runs `tests/ui-harness/tasks.test.js` in a browser against
 expected values, beside the approval page's: opening a task, each way back, a task URL
-loaded or reloaded, a hash naming no task, leaving with an edit open, and agent
-markdown drawn and shown as typed. Unlike the approval page's, these read layout boxes
+loaded or reloaded, a hash naming no task, leaving with an edit open, agent
+markdown drawn and shown as typed, and the spec editor: its field's height against its
+mirror's, the mirror drawn as text, the caret kept out from under the bands atop the
+page, and the save row. Unlike the approval page's, these read layout boxes
 and scroll offsets, since where the list and the task are is what they hold; still never
 pixels.
 `make ui-diff UI_DIFF_PAGE=tasks` runs `tests/ui-harness/tasks-scenario.js` on the base

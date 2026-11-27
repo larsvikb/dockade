@@ -10,7 +10,7 @@
  * over a textarea lines up with it, and the page decides what it drops and spells the
  * rest. Only LF or CR LF ends a line; a lone CR or U+2028 is inside one.
  *
- * Linear in the text: the spec editor may run it per keystroke, on an agent's text. And
+ * Linear in the text: the spec editor runs it per keystroke, on an agent's text. And
  * spans nest NEST_MAX deep at most, so what is drawn from it stays cheap to lay out.
  *
  * Imports nothing and draws nothing, so the unit tests import it under node
@@ -392,4 +392,45 @@ function matchEmphasis(delims) {
       closer = closer.next;
     }
   }
+}
+
+// ── highlighting ────────────────────────────────────────────────────────────
+
+// A block quote's line, as SOURCE_LINE reads one. Only a source line of its own starts
+// so: no construct inside a line opens with a `>`.
+const QUOTE_LINE = /^ {0,3}>/;
+
+// The spec editor's colouring of `text` (the mirror behind the body's textarea in
+// tasks.js), as runs `{cls, text}` whose texts, joined, are `text` exactly, the
+// neighbours of one class merged. A class names what the detail draws there: "heading"
+// a heading's whole line, "code" a fenced block or a code span with its delimiters,
+// "strong" and "em" a span with its delimiters, the innermost one's, "marker" an item's
+// bullet or number, "quote" a block quote's line whole, "source" any other construct
+// the detail draws as typed, and "" plain text and line ends outside a span. Since it is
+// read off `tokenize`, it colours no emphasis the detail would not draw, and none past
+// NEST_MAX.
+export function highlightRuns(text) {
+  const runs = [];
+  const add = (cls, t) => {
+    const last = runs[runs.length - 1];
+    if (last && last.cls === cls) last.text += t;
+    else runs.push({ cls, text: t });
+  };
+  for (const block of tokenize(text)) {
+    const whole = block.kind === "heading" || block.kind === "code" ? block.kind : null;
+    const spans = [];
+    for (const { kind, text: t } of block.tokens) {
+      if (kind === "eol" && !spans.length) add("", t);
+      else if (whole) add(whole, t);
+      else if (kind.endsWith("-open")) {
+        spans.push(kind.slice(0, -5));
+        add(spans[spans.length - 1], t);
+      } else if (kind.endsWith("-close")) add(spans.pop(), t);
+      else if (spans.length) add(spans[spans.length - 1], t);
+      else if (kind === "bullet" || kind === "number") add("marker", t);
+      else if (kind === "source") add(QUOTE_LINE.test(t) ? "quote" : "source", t);
+      else add("", t);
+    }
+  }
+  return runs;
 }

@@ -13,9 +13,10 @@ one package; and each Dockerfile copies in its own ``requirements.txt`` once and
 one ``pip install`` line, exactly ``INSTALL``. Whether the closure is complete is ``pip check``'s, at
 the image build. DESIGN.md's CI section gives the rule.
 
-The files are read as text, by line shape, as ``test_python_pin.py`` reads the
-Dockerfiles. A line out of the shape read here fails, naming its file, rather than
-matching nothing and passing.
+The files are read as text: a ``requirements.txt`` by line shape, a Dockerfile's
+instructions through ``test_topology.py``'s reader, joined as BuildKit joins them. A
+line out of the shape read here fails, naming its file, rather than matching nothing
+and passing.
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ from pathlib import Path
 # The services that ship, one list with test_python_pin.py's. Each must be among the
 # files the glob finds, so one whose requirements.txt moves fails rather than dropping out.
 from test_python_pin import ROOT, SERVICES
+from test_topology import _dockerfile_instructions
 
 # A package a file pinning fastapi must pin too: fastapi only bounds them, and the
 # services rely on their behaviour.
@@ -63,18 +65,11 @@ def pins(path: Path, label: str) -> dict[str, str]:
     return found
 
 
-def _logical_lines(text: str) -> list[str]:
-    """The Dockerfile's instructions: comment lines dropped, continuations joined."""
-    code = "\n".join(line for line in text.splitlines()
-                     if not line.lstrip().startswith("#"))
-    return [line for line in re.sub(r"\\\n", " ", code).splitlines() if line.strip()]
-
-
 def check_dockerfile(path: Path, service: str) -> None:
     """The service's own requirements.txt is copied in once, and installed by one line
     of exactly ``INSTALL``'s shape: the file and nothing else, then ``pip check``."""
     label = f"{service}/Dockerfile"
-    lines = _logical_lines(path.read_text())
+    lines = [text for _, text in _dockerfile_instructions(path.read_text())]
     copies = [line.split() for line in lines
               if re.match(r"\s*COPY\s", line, re.IGNORECASE) and "requirements" in line]
     if len(copies) != 1:
@@ -299,6 +294,29 @@ class FixtureTests(unittest.TestCase):
     def test_a_continued_install_line_is_read_whole(self):
         text = _replace(" && pip check", " \\\n    && pip check", _DOCKERFILE)
         check(self.build(dockerfiles={"widgets": text}), ("acme", "widgets"))
+
+    def test_the_dockerfile_is_read_as_the_builder_joins_it(self):
+        copy = "COPY requirements.txt ./requirements.txt\n"
+        install = " && pip check"
+        for name, old, new, why in (
+                ("an unindented continuation runs on with no separator",
+                 copy, "COPY requirements\\\n.txt ./requirements.txt\n", None),
+                ("a backslash followed by a space and a tab continues",
+                 install, " \\ \t\n    && pip check", None),
+                ("an escaped backslash ends the instruction",
+                 copy, "RUN echo a\\\\\n" + copy, None),
+                ("a copy after an escaped backslash is seen",
+                 copy, copy + "RUN echo a\\\\\nCOPY other/requirements.txt ./r.txt\n",
+                 r"expected one COPY of requirements\.txt, found 2"),
+                ("a blank line inside a continuation is skipped",
+                 install, " \\\n\n    && pip check", None)):
+            with self.subTest(name):
+                text = _replace(old, new, _DOCKERFILE)
+                root = self.build(dockerfiles={"widgets": text})
+                if why is None:
+                    check(root, ("acme", "widgets"))
+                else:
+                    self.fails(root, rf"widgets/Dockerfile: {why}")
 
     def test_the_copy_from_a_repo_root_context_passes(self):
         text = _replace("COPY requirements.txt ", "COPY --chown=0:0 widgets/requirements.txt ",

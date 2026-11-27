@@ -5,7 +5,9 @@
 # risking a fail-open, and a tag can be repointed at a new image under the same
 # name). The tag is kept for human readability; the @sha256 is what's enforced.
 # Upgrades are deliberate: bump the tag AND the digest together, rebuild, re-run
-# boundary-check.sh. Get the digest for a new tag with:
+# boundary-check.sh, and check `docker logs egress-proxy` shows mitmdump's startup
+# line at once (the PYTHONUNBUFFERED below works only while mitmdump is a plain
+# Python console script). Get the digest for a new tag with:
 #   docker image inspect mitmproxy/mitmproxy:<tag> --format '{{index .RepoDigests 0}}'
 FROM mitmproxy/mitmproxy:12.2.3@sha256:00b77b5d8804c8ad18cb6caefbf9d5849e895e8986c5ce011f4ae30f4385962f
 
@@ -22,6 +24,15 @@ USER root
 RUN mkdir -p /var/log/egress \
     && chown -R mitmproxy:mitmproxy /var/log/egress /opt/egress
 USER mitmproxy
+
+# mitmdump's termlog prints each record, the addon's audit lines among them,
+# without flushing, and a container's stdout is a pipe, so Python block-buffers it:
+# without this, `docker logs egress-proxy` (and `make logs-ep`) holds them until
+# about 8 KB has built up or a flow mitmdump prints (a refused CONNECT, a plain-HTTP
+# request) flushes the stream; an allowed HTTPS tunnel is not printed and flushes
+# nothing. Held lines are lost if the process is killed outright (SIGKILL, the OOM
+# killer); on SIGTERM mitmdump flushes them as it exits.
+ENV PYTHONUNBUFFERED=1
 
 # Regular (forward) proxy on 8080.
 #   connection_strategy=lazy — don't dial upstream until after we've decided, so a

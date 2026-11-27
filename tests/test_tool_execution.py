@@ -1583,6 +1583,14 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.reply = self._reply('{"content": [], "isError": true, "n": NaN}')
         self._assert_substituted(self.allow(), self.NON_FINITE, "tool-error")
 
+    def test_an_unencodable_tool_errors_text_stays_off_its_row(self):
+        # Unlike a misshapen one's: the text may be the very thing that failed to
+        # encode, so the row keeps only the gateway's sentence.
+        self.reply = self._reply(
+            '{"content": [{"type": "text", "text": "denied \\ud800"}], "isError": true}')
+        self._assert_substituted(self.allow(), self.SURROGATE, "tool-error")
+        self.assertNotIn("denied", self.rows[0]["reason"])
+
     def test_an_rpc_error_quoting_an_unsendable_string_is_replaced_without_ran(self):
         # The rejection's text quotes the server's string error, so it can fail to
         # encode too; the call never ran, and the substitute must not say it did.
@@ -1615,6 +1623,95 @@ class OutcomeRecordTests(ExecutionTestCase):
         self.assertEqual(returned, {"content": [{"type": "text",
                                                  "text": "räk \U0001f600"}]})
         self.assertIs(self.rows[0]["result"], returned)
+
+    #: Content values a server can send that are not a list: every other JSON type.
+    NOT_A_LIST = (("integer", 5), ("float", 1.5), ("true", True), ("false", False),
+                  ("null", None), ("string", "x"),
+                  ("object", {"type": "text", "text": "x"}))
+    #: List entries that are not content blocks, each put BEFORE a text block.
+    NOT_A_BLOCK = (("number", 5), ("string", "x"), ("null", None), ("list", []))
+    SAID = "Resource not accessible"
+
+    def _misshapen_cases(self, content):
+        """Each server status, on each path, with ``content`` as the result's."""
+        for status, flag in (("tool-error", {"isError": True}), ("ok", {})):
+            for path, run in (("allow", self.allow), ("resume", self.granted)):
+                self._fresh()
+                self.reply = sse({"content": content, **flag})
+                yield status, path, run
+
+    def test_content_that_is_not_a_list_is_replaced_and_recorded_so(self):
+        # The defect: a tool-error's `_first_text` iterated an integer, raised out of
+        # `_run`, and left a 500 with no row. Now one row saying the call ran, and a
+        # result the agent's client can take.
+        for label, content in self.NOT_A_LIST:
+            for status, path, run in self._misshapen_cases(content):
+                with self.subTest(content=label, status=status, path=path):
+                    self._assert_substituted(run(), self.execute.MISSHAPEN, status)
+                    self.assertEqual(self.rows[0]["resume_token"],
+                                     TOKEN if path == "resume" else None)
+                    self.assertNotIn("The server said", self.rows[0]["reason"])
+
+    def test_a_block_that_is_not_an_object_is_replaced_keeping_a_tool_errors_text(self):
+        # The non-block comes first, so `_first_text` must step over it to the text.
+        # A tool-error's text is its reason and stays on the row; an ok reply's is
+        # content and stays off it.
+        for label, block in self.NOT_A_BLOCK:
+            content = [block, {"type": "text", "text": self.SAID}]
+            for status, path, run in self._misshapen_cases(content):
+                with self.subTest(block=label, status=status, path=path):
+                    self._assert_substituted(run(), self.execute.MISSHAPEN, status)
+                    reason = self.rows[0]["reason"]
+                    if status == "tool-error":
+                        self.assertTrue(reason.endswith(
+                            f"The server said: {self.SAID}"), reason)
+                    else:
+                        self.assertNotIn(self.SAID, reason)
+                        self.assertNotIn("The server said", reason)
+
+    def test_a_misshapen_tool_errors_empty_text_adds_nothing_to_its_reason(self):
+        # An empty first text says nothing, so the reason ends at the gateway's own
+        # sentence rather than at "The server said: ".
+        for status, path, run in self._misshapen_cases([5, {"type": "text",
+                                                             "text": ""}]):
+            if status != "tool-error":
+                continue
+            with self.subTest(path=path):
+                self._assert_substituted(run(), self.execute.MISSHAPEN, status)
+                self.assertTrue(self.rows[0]["reason"].endswith(self.execute.MISSHAPEN),
+                                self.rows[0]["reason"])
+
+    def test_a_block_whose_text_is_not_a_string_is_passed_on(self):
+        # A list of objects is the line: a block's own fields are not checked, and the
+        # reason is the first block that does carry text.
+        for label, block in (("image", {"type": "image"}), ("text 5", {"text": 5})):
+            with self.subTest(block=label):
+                self._fresh()
+                result = {"content": [block, {"type": "text", "text": self.SAID}],
+                          "isError": True}
+                self.reply = sse(result)
+                self.assertEqual(self.allow(), result)
+                self.assertEqual([(r["status"], r["reason"]) for r in self.rows],
+                                 [("tool-error", self.SAID)])
+
+    def test_absent_content_is_passed_on(self):
+        # The schema defaults it to empty, so a client takes it.
+        for status, result in (("tool-error", {"isError": True}), ("ok", {})):
+            with self.subTest(status=status):
+                self._fresh()
+                self.reply = sse(result)
+                self.assertEqual(self.allow(), result)
+                self.assertEqual([(r["status"], r["reason"]) for r in self.rows],
+                                 [(status, None)])
+
+    def test_the_reason_is_read_safely_whatever_the_shape_check_says(self):
+        # `_first_text` keeps its own guard: with the shape check out of the way it
+        # still reads an integer content as no text, rather than raising.
+        self.reply = sse({"content": 5, "isError": True})
+        with mock.patch.object(self.execute, "_misshapen", return_value=False):
+            self.allow()
+        self.assertEqual([(r["status"], r["reason"]) for r in self.rows],
+                         [("tool-error", None)])
 
     def _with_answer(self, answer, name, args=None):
         self.answer = answer

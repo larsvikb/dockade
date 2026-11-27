@@ -6,12 +6,15 @@
 // and "Reconnect"), the saturation banner (control-plane/DESIGN.md, "Dismissal is
 // server-side, and it is a high-water mark"), and what each list says when its read
 // fails before or after one succeeded, stale vs failed (control-plane-ui/DESIGN.md,
-// "Empty vs. stale, on both polled lists"), and the decisions' outage line and rows,
-// for a proxy failing closed (DESIGN.md, "Telling an outage denial from a policy
-// denial"). Every expected value is worked out by hand from that spec, app.js's comments
-// on lampState, backoffDelay and STREAM_SILENT_MS, saturation.js's saturationState and
-// ackCount with renderSaturation and the Dismiss handler in app.js, status.js's
-// sentences, audit.js's outageSummary, renderGrouped, renderEvents and renderOutage, and
+// "Empty vs. stale, on both polled lists"), the decisions' outage line and rows, for a
+// proxy failing closed (DESIGN.md, "Telling an outage denial from a policy denial"),
+// and the desktop notification: when an arrival raises one, when its hold's leaving
+// closes it, and the button that asks for it. Every expected value is worked out by
+// hand from that spec, app.js's comments on lampState, backoffDelay and
+// STREAM_SILENT_MS, saturation.js's saturationState and ackCount with renderSaturation
+// and the Dismiss handler in app.js, status.js's sentences, audit.js's outageSummary,
+// renderGrouped, renderEvents and renderOutage, holds.js's approvalNotices,
+// shouldNotify and notifyButton with app.js's notifyArrivals and closeNotice, and
 // backend.js's fixture; none is copied from a run.
 //
 //   node failing-state.test.js <served dir>
@@ -68,6 +71,7 @@ function litLamps(href) {
 // The approval page loaded on a reset backend with the fake stream's heartbeats, at
 // `hash`. `silent` silences the stream from its first instant: in an init script after
 // the heartbeats', since the beat the fake sends on opening lands during the load.
+// `notify` installs the faked Notification below with its settings, before the load.
 // `beforeLoad` sets the backend up for the load's own reads. Every rules read is
 // recorded in `rulesReads` with the status it was answered, every saturation
 // acknowledgement's body in `acks`, and `answers(request)` the statuses every request,
@@ -76,7 +80,8 @@ function litLamps(href) {
 // of what is listed.
 const failingReads = new Set();
 const UNAVAILABLE = { status: 503, json: { detail: "upstream unavailable" } };
-async function approvalPage(t, { silent = false, hash = "", beforeLoad = () => {} } = {}) {
+async function approvalPage(t, { silent = false, hash = "", notify = null,
+                                 beforeLoad = () => {} } = {}) {
   backend.reset();
   failingReads.clear();
   beforeLoad();
@@ -99,6 +104,7 @@ async function approvalPage(t, { silent = false, hash = "", beforeLoad = () => {
   const { page, helpers } = run;
   await page.addInitScript(heartbeats);
   if (silent) await page.addInitScript(() => window.__harnessSilence(true));
+  if (notify) await page.addInitScript(fakeNotification, notify);
   await helpers.load();
   await helpers.settle();
 
@@ -795,4 +801,270 @@ test("the record view marks only the raw fail-closed event and says 1 request; t
 
   await act(() => page.click("#audit-newer"));
   assert.deepEqual(await outageState(page, "audit-events"), first);
+});
+
+// ── the desktop notification ────────────────────────────────────────────────
+
+// The one indicator that reaches an operator looking elsewhere
+// (control-plane-ui/DESIGN.md, "Tabbed views + traffic-light favicon"): app.js's
+// notifyArrivals and closeNotice over holds.js's approvalNotices and shouldNotify, and
+// the header button over notifyButton. Titles and bodies are approvalNotices' with
+// cardSubject's subjects of backend.js's holds; the button's words are notifyButton's
+// table.
+//
+// The browser's Notification, faked before the load: `permission` is what it starts
+// at and `answer` what requestPermission sets it to. Every constructor attempt is
+// recorded in `raised`, one that throws (`throws`) included, each close() in `closed`
+// by its notice's tag, and each permission request in `asked`. `insecure` makes the
+// page no secure context. The document's visibility is the test's to set with
+// `__harnessHide`, which fires visibilitychange as the browser does.
+function fakeNotification({ permission = "granted", answer = permission, throws = false,
+                            insecure = false }) {
+  const log = { raised: [], closed: [], asked: 0 };
+  class FakeNotification {
+    static permission = permission;
+    static async requestPermission() {
+      log.asked++;
+      FakeNotification.permission = answer;
+      return answer;
+    }
+    constructor(title, options = {}) {
+      this.tag = options.tag ?? null;
+      log.raised.push({ title, body: options.body ?? null, tag: this.tag });
+      if (throws) throw new TypeError("Illegal constructor");
+    }
+    close() { log.closed.push(this.tag); }
+  }
+  window.Notification = FakeNotification;
+  if (insecure) Object.defineProperty(window, "isSecureContext", { get: () => false });
+  let hidden = false;
+  Object.defineProperty(document, "visibilityState",
+                        { get: () => (hidden ? "hidden" : "visible") });
+  Object.defineProperty(document, "hidden", { get: () => hidden });
+  window.__harnessNotices = () => structuredClone(log);
+  window.__harnessHide = on => {
+    hidden = on;
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+}
+
+const notices = page => page.evaluate(() => window.__harnessNotices());
+const hide = (page, on) => page.evaluate(h => window.__harnessHide(h), on);
+// A push of the stream's whole shape, for one that carries more than holds.
+const pushEvent = (page, data) => page.evaluate(d => window.__harnessPush(d), data);
+// The header button as a user sees it: null while hidden.
+async function notifyButtonShown(page) {
+  const b = page.locator("#notify");
+  if (!await b.isVisible()) return null;
+  return { text: await b.textContent(), title: await b.getAttribute("title"),
+           disabled: await b.isDisabled() };
+}
+
+const [EGRESS, TOOL] = backend.HOLDS;
+const NEEDED = "Dockade approval needed";
+const EGRESS_NOTICE = { title: NEEDED, body: "registry.example.org", tag: "egress-1" };
+const TOOL_NOTICE = { title: NEEDED, body: "create_pull_request on mcp-github",
+                      tag: "tool-1" };
+// STALE_HOLD arriving onto HOLDS: one arrival, with the two before it 3 pending.
+const STALE_NOTICE = { title: NEEDED,
+                       body: "create_pull_request on mcp-github · 3 pending",
+                       tag: "tool-2" };
+const QUIET = { raised: [], closed: [], asked: 0 };
+
+// Loaded at #policy, where an arrival may notify, unless the test says otherwise: on
+// the Approvals view, the default, a case that expects nothing raised would pass for
+// that reason alone.
+const notifyPage = (t, notify = {}, hash = "#policy") =>
+  approvalPage(t, { hash, notify });
+
+test("a first push carrying holds raises no notice; an arrival after it raises one, "
+     + "tagged, counting the 3 pending, and a push repeating them raises none", TIMEOUT,
+     async t => {
+  const { page, helpers, act } = await notifyPage(t);
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page), QUIET);
+
+  await act(() => helpers.push([...backend.HOLDS, backend.STALE_HOLD]));
+  assert.deepEqual(await notices(page), { ...QUIET, raised: [STALE_NOTICE] });
+
+  await act(() => helpers.push([...backend.HOLDS, backend.STALE_HOLD]));
+  assert.deepEqual(await notices(page), { ...QUIET, raised: [STALE_NOTICE] });
+});
+
+test("a first push of none primes as well: the holds after it raise one notice each, "
+     + "with no count, since they are all that is pending", TIMEOUT, async t => {
+  const { page, helpers, act } = await notifyPage(t);
+  await act(() => helpers.push([]));
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page),
+                   { ...QUIET, raised: [EGRESS_NOTICE, TOOL_NOTICE] });
+});
+
+// Above NOTIFY_MAX, 3, the arrivals of one push collapse into a summary with no tag.
+test("four arrivals in one push raise one summary naming each, with no tag", TIMEOUT,
+     async t => {
+  const { page, helpers, act } = await notifyPage(t);
+  await act(() => helpers.push([]));
+  await act(() => helpers.push([
+    ...backend.HOLDS, backend.STALE_HOLD,
+    { ...EGRESS, id: "egress-2", host: "files.example.com" },
+  ]));
+  assert.deepEqual(await notices(page), { ...QUIET, raised: [{
+    title: "4 Dockade approvals needed",
+    body: "registry.example.org, create_pull_request on mcp-github, "
+        + "create_pull_request on mcp-github, files.example.com",
+    tag: null,
+  }] });
+});
+
+test("on the Approvals view an arrival raises none, its card being on screen; once "
+     + "Policy is opened the next arrival raises one", TIMEOUT, async t => {
+  const { page, helpers, act, show } = await notifyPage(t, {}, "");
+  await act(() => helpers.push([]));
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page), QUIET);
+
+  await show("policy");
+  await act(() => helpers.push([...backend.HOLDS, backend.STALE_HOLD]));
+  assert.deepEqual(await notices(page), { ...QUIET, raised: [STALE_NOTICE] });
+});
+
+test("on the Approvals view with the document hidden an arrival raises one each",
+     TIMEOUT, async t => {
+  const { page, helpers, act } = await notifyPage(t, {}, "");
+  await act(() => helpers.push([]));
+  await act(() => hide(page, true));
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page),
+                   { ...QUIET, raised: [EGRESS_NOTICE, TOOL_NOTICE] });
+});
+
+// A notice is closed by its hold leaving the queue, however it left (closeNotice's
+// comment), and only its own. Each case starts from HOLDS arriving on a primed page.
+async function bothRaised(t) {
+  const p = await notifyPage(t);
+  await p.act(() => p.helpers.push([]));
+  await p.act(() => p.helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(p.page),
+                   { ...QUIET, raised: [EGRESS_NOTICE, TOOL_NOTICE] });
+  return p;
+}
+
+test("a hold resolved elsewhere, gone from a push with time left, closes its notice "
+     + "and no other", TIMEOUT, async t => {
+  const { page, helpers, act } = await bothRaised(t);
+  await act(() => helpers.push([TOOL]));
+  assert.deepEqual(await notices(page),
+                   { ...QUIET, raised: [EGRESS_NOTICE, TOOL_NOTICE],
+                     closed: ["egress-1"] });
+});
+
+test("a tool ask the agent withdrew, in the push's withdrawn list, closes its notice "
+     + "and no other", TIMEOUT, async t => {
+  const { page, act } = await bothRaised(t);
+  await act(() => pushEvent(page, { holds: [EGRESS], withdrawn: ["tool-1"] }));
+  assert.deepEqual(await notices(page),
+                   { ...QUIET, raised: [EGRESS_NOTICE, TOOL_NOTICE],
+                     closed: ["tool-1"] });
+});
+
+// A copy of the tool ask with 3 s of its window left at the load, gone from the first
+// push after its deadline.
+test("a tool ask that expired, gone from the push after its deadline, closes its notice "
+     + "and no other", TIMEOUT, async t => {
+  const { page, helpers, act, tick } = await notifyPage(t);
+  const expiring = { ...TOOL, id: "tool-3", ts: NOW_S - 117, deadline: NOW_S + 3 };
+  await act(() => helpers.push([]));
+  await act(() => helpers.push([...backend.HOLDS, expiring]));
+  const raised = [EGRESS_NOTICE, TOOL_NOTICE, { ...TOOL_NOTICE, tag: "tool-3" }];
+  assert.deepEqual(await notices(page), { ...QUIET, raised });
+
+  await tick(4000);
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page), { ...QUIET, raised, closed: ["tool-3"] });
+});
+
+// The operator's own Deny once, from the Approvals view opened after the arrivals
+// (cards draw only there, and arrivals there raise nothing), with the push that drops
+// the hold following before the card is swept: task 432 is the one that comes later.
+test("the operator's own Deny once, followed by the push without the hold, closes its "
+     + "notice and no other", TIMEOUT, async t => {
+  const { page, helpers, act, show } = await bothRaised(t);
+  await show("approvals");
+  await act(() => page.locator('#pending .card[data-id="egress-1"] '
+                               + 'button[data-action="deny_once"]').click());
+  await act(() => helpers.push([TOOL]));
+  assert.deepEqual(await notices(page),
+                   { ...QUIET, raised: [EGRESS_NOTICE, TOOL_NOTICE],
+                     closed: ["egress-1"] });
+});
+
+// The button, by permission (holds.js, notifyButton): only the default state is
+// clickable, and only granted lets an arrival notify.
+test("with permission not yet asked the button reads \"notify me\" and an arrival raises "
+     + "none; its click asks, and once granted the button hides and arrivals notify",
+     TIMEOUT, async t => {
+  const { page, helpers, act } = await notifyPage(t, { permission: "default",
+                                                       answer: "granted" });
+  assert.deepEqual(await notifyButtonShown(page), {
+    text: "notify me", title: "Raise a desktop notification when an approval arrives",
+    disabled: false,
+  });
+  await act(() => helpers.push([]));
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page), QUIET);
+
+  await act(() => page.click("#notify"));
+  assert.equal((await notices(page)).asked, 1);
+  assert.equal(await notifyButtonShown(page), null);
+  await act(() => helpers.push([...backend.HOLDS, backend.STALE_HOLD]));
+  assert.deepEqual(await notices(page), { ...QUIET, asked: 1, raised: [STALE_NOTICE] });
+});
+
+test("with permission denied the button reads \"notifications blocked\", disabled, and "
+     + "an arrival raises none", TIMEOUT, async t => {
+  const { page, helpers, act } = await notifyPage(t, { permission: "denied" });
+  assert.deepEqual(await notifyButtonShown(page), {
+    text: "notifications blocked",
+    title: "This browser is blocking notifications for this site. Only its site "
+         + "settings can undo that.",
+    disabled: true,
+  });
+  await act(() => helpers.push([]));
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page), QUIET);
+});
+
+test("with permission granted the button is hidden", TIMEOUT, async t => {
+  const { page } = await notifyPage(t);
+  assert.equal(await notifyButtonShown(page), null);
+});
+
+const UNAVAILABLE_BUTTON = {
+  text: "notifications unavailable",
+  title: "Notifications need a secure origin. This page is served over plain HTTP under "
+       + "a name the browser does not treat as one — reach it on localhost instead.",
+  disabled: true,
+};
+
+test("outside a secure context, permission granted, the button reads \"notifications "
+     + "unavailable\", disabled, and an arrival raises none", TIMEOUT, async t => {
+  const { page, helpers, act } = await notifyPage(t, { insecure: true });
+  assert.deepEqual(await notifyButtonShown(page), UNAVAILABLE_BUTTON);
+  await act(() => helpers.push([]));
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page), QUIET);
+});
+
+test("a constructor that throws is tried once for a push of two arrivals, the button "
+     + "then reads \"notifications unavailable\", and the next arrival tries nothing",
+     TIMEOUT, async t => {
+  const { page, helpers, act } = await notifyPage(t, { throws: true });
+  await act(() => helpers.push([]));
+  await act(() => helpers.push(backend.HOLDS));
+  assert.deepEqual(await notices(page), { ...QUIET, raised: [EGRESS_NOTICE] });
+  assert.deepEqual(await notifyButtonShown(page), UNAVAILABLE_BUTTON);
+
+  await act(() => helpers.push([...backend.HOLDS, backend.STALE_HOLD]));
+  assert.deepEqual(await notices(page), { ...QUIET, raised: [EGRESS_NOTICE] });
 });

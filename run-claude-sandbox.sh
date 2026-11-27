@@ -123,6 +123,10 @@ fi
 # which is a degraded but useful mode for this tier.
 sc_ensure_network "$SANDBOX_NET" true
 
+# Nothing but the egress proxy and the tool gateway may sit on both this network and
+# mcp-net: see sandbox-lib.sh.
+sc_refuse_dual_homed "$SANDBOX_NET"
+
 # Governed egress and, in governed mode, the tool gateway: see sandbox-lib.sh.
 sc_governed_egress "$SANDBOX_NET"
 

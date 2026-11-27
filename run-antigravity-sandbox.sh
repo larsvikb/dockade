@@ -89,6 +89,10 @@ fi
 # egress no proxy audits. Refuse instead.
 sc_ensure_network "$SANDBOX_NET" false
 
+# Nothing but the egress proxy and the tool gateway may sit on both this network and
+# mcp-net: see sandbox-lib.sh.
+sc_refuse_dual_homed "$SANDBOX_NET"
+
 # Governed egress and the tool gateway: see sandbox-lib.sh. The model host is where
 # agy's inference goes (NOTES.md, "agy behind dockade's proxy, measured before its
 # tier"); boundary-check.sh asserts it answers through the proxy.

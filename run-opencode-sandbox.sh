@@ -88,6 +88,10 @@ fi
 # no-egress agent the egress its whole design forbids, so refuse instead.
 sc_ensure_network "$SANDBOX_NET" false
 
+# Nothing but the egress proxy and the tool gateway may sit on both this network and
+# mcp-net: see sandbox-lib.sh.
+sc_refuse_dual_homed "$SANDBOX_NET"
+
 # The inference service is this tier's ONLY permitted destination, so its absence
 # is fatal rather than degraded: an opencode sandbox with no model is not a
 # reduced-capability sandbox, it is a broken one. Discover the address (rather
